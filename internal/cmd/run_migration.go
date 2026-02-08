@@ -377,6 +377,8 @@ func executeMigrationStep(_ *formula.Formula, cp *MigrationCheckpoint, step *for
 			c.Env = append(os.Environ(), "GT_MIGRATION=1")
 
 			output, err := c.CombinedOutput()
+			// Capture ctx.Err() before cancel() could modify context state
+			ctxErr := ctx.Err()
 			cancel()
 			outputStr := strings.TrimSpace(string(output))
 
@@ -390,7 +392,7 @@ func executeMigrationStep(_ *formula.Formula, cp *MigrationCheckpoint, step *for
 			if err != nil {
 				// Distinguish timeout from other failures
 				errMsg := fmt.Sprintf("command failed: %s\nerror: %v\noutput: %s", cmdStr, err, outputStr)
-				if ctx.Err() == context.DeadlineExceeded {
+				if ctxErr == context.DeadlineExceeded {
 					errMsg = fmt.Sprintf("command timed out after %s: %s\noutput: %s", runMigrationTimeout, cmdStr, outputStr)
 				}
 
@@ -403,7 +405,7 @@ func executeMigrationStep(_ *formula.Formula, cp *MigrationCheckpoint, step *for
 					fmt.Fprintf(os.Stderr, "    %s failed to save checkpoint: %v\n", style.Bold.Render("warning:"), saveErr)
 				}
 
-				if ctx.Err() == context.DeadlineExceeded {
+				if ctxErr == context.DeadlineExceeded {
 					return fmt.Errorf("command timed out after %s: %s\n  output: %s", runMigrationTimeout, cmdStr, truncateOutput(outputStr, 500))
 				}
 				return fmt.Errorf("command failed: %s\n  %v\n  output: %s", cmdStr, err, truncateOutput(outputStr, 500))
