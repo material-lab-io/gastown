@@ -496,7 +496,6 @@ func initTownBeads(townPath string) error {
 	}
 
 	// Ensure issues.jsonl exists BEFORE creating routes.jsonl.
-	// bd init creates beads.db but not issues.jsonl in SQLite mode.
 	// If routes.jsonl is created first, bd's auto-export will write issues to routes.jsonl,
 	// corrupting it. Creating an empty issues.jsonl prevents this.
 	issuesJSONL := filepath.Join(townPath, ".beads", "issues.jsonl")

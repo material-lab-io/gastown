@@ -650,7 +650,7 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	// Check for tracked beads and initialize beads.db if missing (Issue #72)
+	// Check for tracked beads and initialize database if missing (Issue #72)
 	rigPath := filepath.Join(townRoot, name)
 	beadsDirCandidates := []string{
 		filepath.Join(rigPath, ".beads"),
@@ -688,16 +688,13 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			f.Close()
 		}
 
-		// Init beads.db if missing
-		beadsDB := filepath.Join(beadsDir, "beads.db")
-		if _, err := os.Stat(beadsDB); os.IsNotExist(err) {
+		// Init database if metadata.json is missing (DB files are gitignored)
+		metadataPath := filepath.Join(beadsDir, "metadata.json")
+		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
 			prefix := result.BeadsPrefix
 			if prefix == "" {
 				break
 			}
-			// Remove stale WAL/SHM files that could cause SQLite errors
-			os.Remove(filepath.Join(beadsDir, "beads.db-wal"))
-			os.Remove(filepath.Join(beadsDir, "beads.db-shm"))
 			workDir := filepath.Dir(beadsDir) // directory containing .beads/
 			initCmd := exec.Command("bd", "--no-daemon", "init", "--prefix", prefix)
 			initCmd.Dir = workDir
