@@ -635,7 +635,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 	if freshlySpawned {
 		pane, err := newPolecatInfo.StartSession()
 		if err != nil {
-			// Rollback: session failed, clean up zombie artifacts (worktree, hooked bead, convoy).
+			// Rollback: session failed, clean up zombie artifacts (worktree, hooked bead).
 			// Without rollback, next sling attempt fails with "bead already hooked" (gt-jn40ft).
 			fmt.Printf("%s Session failed, rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), newPolecatInfo.PolecatName)
 			rollbackSlingArtifacts(newPolecatInfo, beadID, hookWorkDir)
@@ -704,7 +704,9 @@ func slingBackoff(attempt int, base, max time.Duration) time.Duration { //nolint
 func rollbackSlingArtifacts(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir string) {
 	// 1. Unhook the bead (set status back to open so it can be re-slung)
 	townRoot, err := workspace.FindFromCwdOrError()
-	if err == nil {
+	if err != nil {
+		fmt.Printf("  %s Could not find workspace to unhook bead %s: %v\n", style.Dim.Render("Warning:"), beadID, err)
+	} else {
 		unhookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
 		unhookCmd := exec.Command("bd", "--no-daemon", "update", beadID, "--status=open", "--assignee=")
 		unhookCmd.Dir = unhookDir
