@@ -73,14 +73,19 @@ func ParseRigFields(description string) *RigFields {
 
 // CreateRigBead creates a rig identity bead for tracking rig metadata.
 // The ID format is: <prefix>-rig-<name> (e.g., gt-rig-gastown)
-// Use RigBeadID() helper to generate correct IDs.
+// The ID is constructed internally from fields.Prefix and name.
 // The created_by field is populated from BD_ACTOR env var for provenance tracking.
-func (b *Beads) CreateRigBead(id, title string, fields *RigFields) (*Issue, error) {
-	description := FormatRigDescription(title, fields)
+func (b *Beads) CreateRigBead(name string, fields *RigFields) (*Issue, error) {
+	prefix := "gt"
+	if fields != nil && fields.Prefix != "" {
+		prefix = fields.Prefix
+	}
+	id := RigBeadIDWithPrefix(prefix, name)
+	description := FormatRigDescription(name, fields)
 
 	args := []string{"create", "--json",
 		"--id=" + id,
-		"--title=" + title,
+		"--title=" + name,
 		"--description=" + description,
 		"--labels=gt:rig",
 	}
