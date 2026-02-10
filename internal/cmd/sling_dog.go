@@ -113,18 +113,21 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 		}
 
 		if targetDog == nil {
-			if opts.Create {
-				// No idle dogs - create one
-				newName := generateDogName(mgr)
-				targetDog, err = mgr.Add(newName)
-				if err != nil {
-					return nil, fmt.Errorf("creating dog %s: %w", newName, err)
-				}
-				fmt.Printf("✓ Created dog %s (pool was empty)\n", newName)
-				spawned = true
-			} else {
-				return nil, fmt.Errorf("no idle dogs available (use --create to add)")
+			// No idle dogs — auto-create one if pool is below capacity
+			poolSize, err := mgr.PoolSize()
+			if err != nil {
+				return nil, fmt.Errorf("checking pool size: %w", err)
 			}
+			if poolSize >= dog.MaxPoolSize {
+				return nil, fmt.Errorf("%w: all %d dogs are busy", dog.ErrPoolFull, poolSize)
+			}
+			newName := generateDogName(mgr)
+			targetDog, err = mgr.Add(newName)
+			if err != nil {
+				return nil, fmt.Errorf("creating dog %s: %w", newName, err)
+			}
+			fmt.Printf("✓ Created dog %s (pool: %d/%d)\n", newName, poolSize+1, dog.MaxPoolSize)
+			spawned = true
 		}
 	}
 

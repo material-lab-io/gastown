@@ -17,6 +17,10 @@ import (
 	"github.com/steveyegge/gastown/internal/util"
 )
 
+// MaxPoolSize is the maximum number of dogs allowed in the pool.
+// Pool dispatch auto-creates dogs up to this limit.
+const MaxPoolSize = 4
+
 // Common errors
 var (
 	ErrDogExists   = errors.New("dog already exists")
@@ -24,6 +28,7 @@ var (
 	ErrDogWorking  = errors.New("dog is currently working")
 	ErrNoRigs      = errors.New("no rigs configured")
 	ErrInvalidName = errors.New("invalid dog name")
+	ErrPoolFull    = errors.New("dog pool is at capacity")
 )
 
 // Manager handles dog lifecycle in the kennel.
@@ -669,6 +674,15 @@ func (m *Manager) IdleCount() (int, error) {
 		}
 	}
 	return count, nil
+}
+
+// PoolSize returns the total number of dogs in the pool.
+func (m *Manager) PoolSize() (int, error) {
+	dogs, err := m.List()
+	if err != nil {
+		return 0, err
+	}
+	return len(dogs), nil
 }
 
 // WorkingCount returns the number of working dogs.

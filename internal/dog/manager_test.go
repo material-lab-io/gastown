@@ -137,6 +137,43 @@ func TestValidateDogName(t *testing.T) {
 	}
 }
 
+// TestMaxPoolSize verifies the pool size constant is set.
+func TestMaxPoolSize(t *testing.T) {
+	if MaxPoolSize < 1 {
+		t.Errorf("MaxPoolSize must be at least 1, got %d", MaxPoolSize)
+	}
+	if MaxPoolSize != 4 {
+		t.Errorf("expected MaxPoolSize=4, got %d", MaxPoolSize)
+	}
+}
+
+// TestErrPoolFull verifies the pool-full sentinel error.
+func TestErrPoolFull(t *testing.T) {
+	if ErrPoolFull == nil {
+		t.Fatal("ErrPoolFull should not be nil")
+	}
+	if ErrPoolFull.Error() != "dog pool is at capacity" {
+		t.Errorf("unexpected ErrPoolFull message: %s", ErrPoolFull.Error())
+	}
+}
+
+// TestPoolSizeEmptyKennel verifies PoolSize returns 0 for empty kennel.
+func TestPoolSizeEmptyKennel(t *testing.T) {
+	rigsConfig := &config.RigsConfig{
+		Version: 1,
+		Rigs:    map[string]config.RigEntry{},
+	}
+	m := NewManager(t.TempDir(), rigsConfig)
+
+	size, err := m.PoolSize()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if size != 0 {
+		t.Errorf("expected pool size 0 for empty kennel, got %d", size)
+	}
+}
+
 // TestRemoveEmptyName verifies Remove("") returns ErrInvalidName, not ErrDogNotFound.
 func TestRemoveEmptyName(t *testing.T) {
 	rigsConfig := &config.RigsConfig{

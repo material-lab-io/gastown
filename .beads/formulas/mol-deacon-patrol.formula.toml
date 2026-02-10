@@ -302,11 +302,11 @@ Note which convoys were fed for observability:
 # Convoy <convoy-id> dispatched to dog for feeding (<N> ready issues)
 ```
 
-**If no idle dogs available:**
-Log warning and continue - the convoy will be detected again next cycle.
-Dog pool maintenance step ensures dogs are available.
+**Pool auto-creation:** If no idle dogs are available, pool dispatch automatically
+creates new dogs up to the pool capacity (4). If the pool is full and all dogs
+are busy, log a warning and continue - the convoy will be detected again next cycle.
 
-**Exit criteria:** All stranded convoys have feeding dogs dispatched (or logged if no dogs available)."""
+**Exit criteria:** All stranded convoys have feeding dogs dispatched (or logged if pool is at capacity)."""
 
 [[steps]]
 id = "resolve-external-deps"
