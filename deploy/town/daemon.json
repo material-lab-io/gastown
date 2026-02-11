@@ -1,0 +1,39 @@
+{
+  "heartbeat": {
+    "enabled": true,
+    "interval": "3m"
+  },
+  "patrols": {
+    "deacon": {
+      "enabled": true,
+      "interval": "5m",
+      "agent": "deacon"
+    },
+    "refinery": {
+      "agent": "refinery",
+      "enabled": true,
+      "interval": "5m",
+      "rigs": [
+        "redos",
+        "legend",
+        "nyx_one",
+        "cocoons",
+        "clipfinder"
+      ]
+    },
+    "witness": {
+      "agent": "witness",
+      "enabled": true,
+      "interval": "5m",
+      "rigs": [
+        "redos",
+        "legend",
+        "nyx_one",
+        "cocoons",
+        "clipfinder"
+      ]
+    }
+  },
+  "type": "daemon-patrol-config",
+  "version": 1
+}

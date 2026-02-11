@@ -1,0 +1,13 @@
+[Unit]
+Description=Slack-to-Mayor Relay (polls Slack, forwards to gt mail)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/kanaba/.openclaw/workspaces/mayor/slack-relay.sh
+Restart=always
+RestartSec=10
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/kanaba/.nvm/versions/node/v20.19.5/bin
+
+[Install]
+WantedBy=default.target
