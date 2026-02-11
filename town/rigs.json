@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "rigs": {
+    "clipfinder": {
+      "git_url": "git@github.com:material-lab-io/clipFinder.git",
+      "local_repo": "/home/kanaba/clipFinder/clipFinder-repo",
+      "added_at": "2026-02-10T05:03:01.582347712Z",
+      "beads": {
+        "repo": "",
+        "prefix": "cl"
+      }
+    },
+    "cocoons": {
+      "git_url": "git@github.com:material-lab-io/cocoons.git",
+      "added_at": "2026-02-09T11:44:17.102200247Z",
+      "beads": {
+        "repo": "",
+        "prefix": "coc"
+      }
+    },
+    "legend": {
+      "git_url": "https://github.com/material-lab-io/LEGEND",
+      "added_at": "2026-02-09T00:02:40.769760142Z",
+      "beads": {
+        "repo": "",
+        "prefix": "le"
+      }
+    },
+    "nyx_one": {
+      "git_url": "git@github.com:material-lab-io/nyx-one.git",
+      "added_at": "2026-02-09T09:06:45.479567493Z",
+      "beads": {
+        "repo": "",
+        "prefix": "nx"
+      }
+    },
+    "redos": {
+      "git_url": "https://github.com/material-lab-io/redos.git",
+      "added_at": "2026-02-08T23:55:19.330768081Z",
+      "beads": {
+        "repo": "",
+        "prefix": "re"
+      }
+    }
+  }
+}

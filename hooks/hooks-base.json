@@ -1,0 +1,86 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash(gh pr create*)",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard pr-workflow"
+        }
+      ]
+    },
+    {
+      "matcher": "Bash(git checkout -b*)",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard pr-workflow"
+        }
+      ]
+    },
+    {
+      "matcher": "Bash(git switch -c*)",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard pr-workflow"
+        }
+      ]
+    }
+  ],
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt prime --hook && gt nudge deacon session-started; (/home/kanaba/.openclaw/workspaces/mayor/slack-notify.sh session-start &)"
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt costs record; /home/kanaba/.openclaw/workspaces/mayor/slack-session-summary.sh"
+        }
+      ]
+    }
+  ],
+  "PreCompact": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt prime --hook"
+        }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt mail check --inject"
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "AskUserQuestion",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "(/home/kanaba/.openclaw/workspaces/mayor/slack-notify.sh waiting-input &)"
+        }
+      ]
+    }
+  ]
+}

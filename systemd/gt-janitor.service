@@ -1,0 +1,7 @@
+[Unit]
+Description=Gas Town System Janitor (Docker, worktrees, temp files)
+
+[Service]
+Type=oneshot
+ExecStart=/home/kanaba/.openclaw/workspaces/mayor/gt-janitor.sh
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/kanaba/.nvm/versions/node/v20.19.5/bin:/home/kanaba/.local/bin

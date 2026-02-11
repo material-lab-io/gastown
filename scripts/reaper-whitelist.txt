@@ -1,0 +1,13 @@
+# Gas Town Reaper Whitelist
+# Process names containing any of these strings will never be killed.
+# One pattern per line. Lines starting with # are comments.
+
+VLLM::EngineCore
+vllm serve
+openclaw-gateway
+logflare
+k3s
+kokoro
+piper
+orpheus
+faster-whisper
