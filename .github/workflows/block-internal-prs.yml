@@ -9,9 +9,13 @@ permissions: {}
 jobs:
   block-internal-prs:
     name: Block Internal PRs
-    # Only run if PR is from the same repo (not a fork)
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'renovate[bot]'
-    runs-on: ubuntu-latest
+    # Only block same-repo PRs to the default branch. Integration branch PRs/MRs
+    # are handled by the Gas Town merge queue and must not get default-branch advice.
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
+      github.actor != 'renovate[bot]'
+    runs-on: [self-hosted, gt2]
     permissions:
       issues: write
       pull-requests: write
