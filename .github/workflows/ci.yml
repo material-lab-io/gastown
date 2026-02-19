@@ -10,7 +10,7 @@ jobs:
   # Fast check to catch accidental .beads/issues.jsonl changes from contributors
   check-no-beads-changes:
     name: Check for .beads changes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v6
@@ -37,7 +37,7 @@ jobs:
   # This catches issues where go install @latest would fail
   check-embedded-formulas:
     name: Check embedded formulas
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     steps:
       - uses: actions/checkout@v6
 
@@ -65,7 +65,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -100,7 +100,7 @@ jobs:
   # Separate job to process coverage after ALL tests complete
   coverage:
     name: Coverage Report
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     needs: [test, integration]
     if: github.event_name == 'pull_request'
     steps:
@@ -203,7 +203,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     steps:
       - uses: actions/checkout@v6
 
@@ -220,7 +220,7 @@ jobs:
 
   integration:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     steps:
       - uses: actions/checkout@v6
 

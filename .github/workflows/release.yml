@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   goreleaser:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +44,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-npm:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     needs: goreleaser
     if: ${{ github.repository == 'steveyegge/gastown' }}
     permissions:
@@ -71,7 +71,7 @@ jobs:
           npm publish --access public --provenance
 
   update-homebrew:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gt2]
     needs: goreleaser
     if: ${{ github.repository == 'steveyegge/gastown' }}
     steps:
