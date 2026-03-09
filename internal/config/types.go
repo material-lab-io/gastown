@@ -429,6 +429,32 @@ type WitnessThresholds struct {
 	// DoneIntentRecentGrace is how recently a done-intent must have been created
 	// to be considered still in progress (default "30s").
 	DoneIntentRecentGrace string `json:"done_intent_recent_grace,omitempty"`
+
+	// Escalation configures automatic escalation when a bead exhausts its
+	// respawn budget at the current tier (e.g., upgrade model, route to crew).
+	Escalation *EscalationPolicy `json:"escalation,omitempty"`
+}
+
+// EscalationPolicy configures tiered escalation for repeatedly-failing beads.
+// When enabled, instead of immediately blocking respawns and mailing the mayor,
+// the witness advances through tiers (e.g., upgrade model, route to crew)
+// before giving up.
+type EscalationPolicy struct {
+	// Enabled turns on tiered escalation. Default false (existing behavior).
+	Enabled bool `json:"enabled,omitempty"`
+
+	// AttemptsPerTier is how many respawn attempts are allowed at each tier
+	// before advancing to the next. Default: MaxBeadRespawns value.
+	AttemptsPerTier *int `json:"attempts_per_tier,omitempty"`
+
+	// Tiers is the ordered list of escalation actions.
+	// Valid values: "upgrade-model", "route-crew".
+	// Default: ["upgrade-model", "route-crew"].
+	Tiers []string `json:"tiers,omitempty"`
+
+	// UpgradeAgent is the agent alias to upgrade to (e.g., "opus").
+	// Empty string means use the default agent (which is opus).
+	UpgradeAgent string `json:"upgrade_agent,omitempty"`
 }
 
 // DefaultOperationalConfig returns an OperationalConfig with all defaults.
