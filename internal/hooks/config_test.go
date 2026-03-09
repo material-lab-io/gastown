@@ -4,12 +4,24 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
+// setTestHome sets HOME (and USERPROFILE on Windows) so that
+// os.UserHomeDir() returns tmpDir on all platforms.
+func setTestHome(t *testing.T, tmpDir string) {
+	t.Helper()
+	t.Setenv("HOME", tmpDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", tmpDir)
+	}
+}
+
 func TestLoadSaveBase(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
 	cfg := DefaultBase()
 
@@ -42,7 +54,7 @@ func TestLoadSaveBase(t *testing.T) {
 
 func TestLoadSaveOverride(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
 	cfg := &HooksConfig{
 		PreToolUse: []HookEntry{
@@ -70,9 +82,37 @@ func TestLoadSaveOverride(t *testing.T) {
 	}
 }
 
+func TestLoadOverrideRejectsDuplicateMatchers(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	overridePath := OverridePath("crew")
+	if err := os.MkdirAll(filepath.Dir(overridePath), 0755); err != nil {
+		t.Fatalf("creating overrides dir: %v", err)
+	}
+
+	raw := `{
+  "PreToolUse": [
+    {"matcher": "Bash(git push*)", "hooks": [{"type": "command", "command": "first"}]},
+    {"matcher": "Bash(git push*)", "hooks": [{"type": "command", "command": "second"}]}
+  ]
+}`
+	if err := os.WriteFile(overridePath, []byte(raw), 0644); err != nil {
+		t.Fatalf("writing override: %v", err)
+	}
+
+	_, err := LoadOverride("crew")
+	if err == nil {
+		t.Fatal("expected duplicate matcher error")
+	}
+	if !strings.Contains(err.Error(), "duplicate matcher") {
+		t.Fatalf("expected duplicate matcher error, got: %v", err)
+	}
+}
+
 func TestLoadSaveOverrideRigRole(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
 	cfg := &HooksConfig{
 		SessionStart: []HookEntry{
@@ -101,7 +141,7 @@ func TestLoadSaveOverrideRigRole(t *testing.T) {
 
 func TestLoadMissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
 	_, err := LoadBase()
 	if err == nil {
@@ -123,10 +163,11 @@ func TestValidTarget(t *testing.T) {
 		{"witness", true},
 		{"refinery", true},
 		{"polecats", true},
+		{"polecat", true},
 		{"mayor", true},
 		{"deacon", true},
-		{"rig", true},
-		{"gastown/rig", true},
+		{"rig", false},
+		{"gastown/rig", false},
 		{"gastown/crew", true},
 		{"beads/witness", true},
 		{"sky/polecats", true},
@@ -142,6 +183,35 @@ func TestValidTarget(t *testing.T) {
 		t.Run(tt.target, func(t *testing.T) {
 			if got := ValidTarget(tt.target); got != tt.valid {
 				t.Errorf("ValidTarget(%q) = %v, want %v", tt.target, got, tt.valid)
+			}
+		})
+	}
+}
+
+func TestNormalizeTarget(t *testing.T) {
+	tests := []struct {
+		input      string
+		normalized string
+		valid      bool
+	}{
+		{"crew", "crew", true},
+		{"polecats", "polecats", true},
+		{"polecat", "polecats", true},
+		{"gastown/polecats", "gastown/polecats", true},
+		{"gastown/polecat", "gastown/polecats", true},
+		{"mayor", "mayor", true},
+		{"invalid", "", false},
+		{"gastown/invalid", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, ok := NormalizeTarget(tt.input)
+			if ok != tt.valid {
+				t.Errorf("NormalizeTarget(%q) valid = %v, want %v", tt.input, ok, tt.valid)
+			}
+			if got != tt.normalized {
+				t.Errorf("NormalizeTarget(%q) = %q, want %q", tt.input, got, tt.normalized)
 			}
 		})
 	}
@@ -337,7 +407,7 @@ func TestMergeEmptyOverride(t *testing.T) {
 
 func TestComputeExpected(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
 	base := &HooksConfig{
 		SessionStart: []HookEntry{
@@ -374,15 +444,115 @@ func TestComputeExpected(t *testing.T) {
 	if len(expected.SessionStart) != 1 || expected.SessionStart[0].Hooks[0].Command != "gastown-crew-session" {
 		t.Errorf("expected gastown/crew SessionStart, got %v", expected.SessionStart)
 	}
-	if len(expected.PreToolUse) != 1 || expected.PreToolUse[0].Hooks[0].Command != "crew-guard" {
-		t.Errorf("expected crew PreToolUse, got %v", expected.PreToolUse)
+	// On-disk base has no PreToolUse, so DefaultBase's 3 pr-workflow guards are
+	// backfilled. The crew override adds Bash(git*), making 4 total.
+	defaultPTU := len(DefaultBase().PreToolUse)
+	if len(expected.PreToolUse) != defaultPTU+1 {
+		t.Errorf("expected %d PreToolUse (default %d + crew 1), got %d", defaultPTU+1, defaultPTU, len(expected.PreToolUse))
+	}
+	// Verify crew-guard is present
+	hasCrewGuard := false
+	for _, e := range expected.PreToolUse {
+		if e.Matcher == "Bash(git*)" && e.Hooks[0].Command == "crew-guard" {
+			hasCrewGuard = true
+		}
+	}
+	if !hasCrewGuard {
+		t.Error("expected crew PreToolUse guard to be present")
+	}
+}
+
+// TestComputeExpectedBackfillsSessionStart reproduces gt-y22: on-disk base
+// created before SessionStart was added to DefaultBase. SessionStart should
+// be backfilled from DefaultBase so settings.json files contain PATH exports.
+func TestComputeExpectedBackfillsSessionStart(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	// Simulate a stale hooks-base.json that was created before SessionStart existed.
+	// It has Stop, PreCompact, UserPromptSubmit but no SessionStart.
+	staleBase := &HooksConfig{
+		Stop: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "gt costs record"}}},
+		},
+		PreCompact: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "gt prime --hook"}}},
+		},
+		UserPromptSubmit: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "gt mail check --inject"}}},
+		},
+	}
+	if err := SaveBase(staleBase); err != nil {
+		t.Fatalf("SaveBase failed: %v", err)
+	}
+
+	// All targets should get SessionStart backfilled from DefaultBase
+	for _, target := range []string{"mayor", "crew", "witness", "gastown/crew"} {
+		expected, err := ComputeExpected(target)
+		if err != nil {
+			t.Fatalf("ComputeExpected(%s) failed: %v", target, err)
+		}
+		if len(expected.SessionStart) == 0 {
+			t.Errorf("%s: expected SessionStart to be backfilled from DefaultBase, got none", target)
+		}
+		// Verify PATH= is present (the actual doctor check)
+		hasPath := false
+		for _, entry := range expected.SessionStart {
+			for _, hook := range entry.Hooks {
+				if strings.Contains(hook.Command, "PATH=") {
+					hasPath = true
+				}
+			}
+		}
+		if !hasPath {
+			t.Errorf("%s: expected PATH= in SessionStart hooks", target)
+		}
+		// On-disk Stop should be preserved (not overwritten by DefaultBase)
+		if len(expected.Stop) == 0 {
+			t.Errorf("%s: on-disk Stop should be preserved", target)
+		} else if expected.Stop[0].Hooks[0].Command != "gt costs record" {
+			t.Errorf("%s: on-disk Stop should take precedence, got %q", target, expected.Stop[0].Hooks[0].Command)
+		}
+	}
+}
+
+func TestComputeExpectedFailsOnDuplicateOverrideMatcher(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	if err := SaveBase(DefaultBase()); err != nil {
+		t.Fatalf("SaveBase failed: %v", err)
+	}
+
+	overridePath := OverridePath("crew")
+	if err := os.MkdirAll(filepath.Dir(overridePath), 0755); err != nil {
+		t.Fatalf("creating overrides dir: %v", err)
+	}
+
+	raw := `{
+  "SessionStart": [
+    {"matcher": "", "hooks": [{"type": "command", "command": "first"}]},
+    {"matcher": "", "hooks": [{"type": "command", "command": "second"}]}
+  ]
+}`
+	if err := os.WriteFile(overridePath, []byte(raw), 0644); err != nil {
+		t.Fatalf("writing override: %v", err)
+	}
+
+	_, err := ComputeExpected("crew")
+	if err == nil {
+		t.Fatal("expected ComputeExpected to fail on duplicate matcher")
+	}
+	if !strings.Contains(err.Error(), "duplicate matcher") {
+		t.Fatalf("expected duplicate matcher error, got: %v", err)
 	}
 }
 
 func TestComputeExpectedNoBase(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
+	// Mayor should get DefaultBase (no built-in overrides)
 	expected, err := ComputeExpected("mayor")
 	if err != nil {
 		t.Fatalf("ComputeExpected failed: %v", err)
@@ -390,7 +560,170 @@ func TestComputeExpectedNoBase(t *testing.T) {
 
 	defaultBase := DefaultBase()
 	if !HooksEqual(expected, defaultBase) {
-		t.Error("expected DefaultBase when no configs exist")
+		t.Error("expected DefaultBase for mayor when no configs exist")
+	}
+
+	// Crew should get DefaultBase + built-in crew override (PreCompact)
+	crew, err := ComputeExpected("crew")
+	if err != nil {
+		t.Fatalf("ComputeExpected(crew) failed: %v", err)
+	}
+	// Crew has a built-in PreCompact override, so it won't equal bare DefaultBase
+	if len(crew.PreCompact) == 0 {
+		t.Error("expected crew to have PreCompact hook from DefaultOverrides")
+	}
+	// But it should still have the base SessionStart hooks
+	if len(crew.SessionStart) != len(defaultBase.SessionStart) {
+		t.Error("expected crew to inherit SessionStart from DefaultBase")
+	}
+
+	// Witness should get DefaultBase + built-in patrol-formula-guard (gt-e47hxn)
+	witness, err := ComputeExpected("witness")
+	if err != nil {
+		t.Fatalf("ComputeExpected(witness) failed: %v", err)
+	}
+	// Witness has built-in PreToolUse overrides for patrol-formula-guard
+	if len(witness.PreToolUse) < 4 {
+		t.Errorf("expected witness to have at least 4 PreToolUse hooks from DefaultOverrides (patrol-formula-guard), got %d", len(witness.PreToolUse))
+	}
+	// Should still inherit base SessionStart
+	if len(witness.SessionStart) != len(defaultBase.SessionStart) {
+		t.Error("expected witness to inherit SessionStart from DefaultBase")
+	}
+	// Verify patrol matchers are present
+	patrolMatchers := map[string]bool{
+		"Bash(*bd mol pour*patrol*)":        false,
+		"Bash(*bd mol pour *mol-witness*)":  false,
+		"Bash(*bd mol pour *mol-deacon*)":   false,
+		"Bash(*bd mol pour *mol-refinery*)": false,
+	}
+	for _, entry := range witness.PreToolUse {
+		if _, ok := patrolMatchers[entry.Matcher]; ok {
+			patrolMatchers[entry.Matcher] = true
+		}
+	}
+	for matcher, found := range patrolMatchers {
+		if !found {
+			t.Errorf("witness missing patrol-formula-guard matcher: %s", matcher)
+		}
+	}
+
+	// Deacon should get DefaultBase + built-in patrol-formula-guard (same as witness)
+	deacon, err := ComputeExpected("deacon")
+	if err != nil {
+		t.Fatalf("ComputeExpected(deacon) failed: %v", err)
+	}
+	if len(deacon.PreToolUse) < 4 {
+		t.Errorf("expected deacon to have at least 4 PreToolUse hooks from DefaultOverrides (patrol-formula-guard), got %d", len(deacon.PreToolUse))
+	}
+	if len(deacon.SessionStart) != len(defaultBase.SessionStart) {
+		t.Error("expected deacon to inherit SessionStart from DefaultBase")
+	}
+	deaconPatrolMatchers := map[string]bool{
+		"Bash(*bd mol pour*patrol*)":        false,
+		"Bash(*bd mol pour *mol-witness*)":  false,
+		"Bash(*bd mol pour *mol-deacon*)":   false,
+		"Bash(*bd mol pour *mol-refinery*)": false,
+	}
+	for _, entry := range deacon.PreToolUse {
+		if _, ok := deaconPatrolMatchers[entry.Matcher]; ok {
+			deaconPatrolMatchers[entry.Matcher] = true
+		}
+	}
+	for matcher, found := range deaconPatrolMatchers {
+		if !found {
+			t.Errorf("deacon missing patrol-formula-guard matcher: %s", matcher)
+		}
+	}
+
+	// Refinery should get DefaultBase + built-in patrol-formula-guard (same as witness)
+	refinery, err := ComputeExpected("refinery")
+	if err != nil {
+		t.Fatalf("ComputeExpected(refinery) failed: %v", err)
+	}
+	if len(refinery.PreToolUse) < 4 {
+		t.Errorf("expected refinery to have at least 4 PreToolUse hooks from DefaultOverrides (patrol-formula-guard), got %d", len(refinery.PreToolUse))
+	}
+	if len(refinery.SessionStart) != len(defaultBase.SessionStart) {
+		t.Error("expected refinery to inherit SessionStart from DefaultBase")
+	}
+	refineryPatrolMatchers := map[string]bool{
+		"Bash(*bd mol pour*patrol*)":        false,
+		"Bash(*bd mol pour *mol-witness*)":  false,
+		"Bash(*bd mol pour *mol-deacon*)":   false,
+		"Bash(*bd mol pour *mol-refinery*)": false,
+	}
+	for _, entry := range refinery.PreToolUse {
+		if _, ok := refineryPatrolMatchers[entry.Matcher]; ok {
+			refineryPatrolMatchers[entry.Matcher] = true
+		}
+	}
+	for matcher, found := range refineryPatrolMatchers {
+		if !found {
+			t.Errorf("refinery missing patrol-formula-guard matcher: %s", matcher)
+		}
+	}
+}
+
+// TestComputeExpectedWitnessRigSpecific verifies patrol-formula-guard propagates
+// to rig-specific witness targets (e.g., sky/witness) via the witness role default.
+func TestComputeExpectedWitnessRigSpecific(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	// No on-disk overrides — all witnesses should still get patrol-formula-guard
+	// from the built-in DefaultOverrides for "witness".
+	skyWitness, err := ComputeExpected("sky/witness")
+	if err != nil {
+		t.Fatalf("ComputeExpected(sky/witness) failed: %v", err)
+	}
+
+	// Should have patrol-formula-guard matchers from DefaultOverrides["witness"]
+	patrolCount := 0
+	for _, entry := range skyWitness.PreToolUse {
+		if strings.Contains(entry.Matcher, "bd mol pour") {
+			patrolCount++
+		}
+	}
+	if patrolCount < 4 {
+		t.Errorf("sky/witness expected 4 patrol-formula-guard matchers, got %d", patrolCount)
+	}
+
+	// Should also inherit base hooks (pr-workflow-guard, etc.)
+	if len(skyWitness.SessionStart) == 0 {
+		t.Error("sky/witness should inherit SessionStart from DefaultBase")
+	}
+	if len(skyWitness.UserPromptSubmit) == 0 {
+		t.Error("sky/witness should inherit UserPromptSubmit (mail-check) from DefaultBase")
+	}
+}
+
+// TestComputeExpectedBuiltinPlusOnDisk verifies that on-disk overrides layer
+// on top of built-in defaults rather than replacing them.
+func TestComputeExpectedBuiltinPlusOnDisk(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	// Save an on-disk mayor override that adds a custom SessionStart hook
+	customOverride := &HooksConfig{
+		SessionStart: []HookEntry{
+			{Matcher: "", Hooks: []Hook{{Type: "command", Command: "custom-mayor-session"}}},
+		},
+	}
+	if err := SaveOverride("mayor", customOverride); err != nil {
+		t.Fatalf("SaveOverride failed: %v", err)
+	}
+
+	expected, err := ComputeExpected("mayor")
+	if err != nil {
+		t.Fatalf("ComputeExpected failed: %v", err)
+	}
+
+	// Should have the custom SessionStart from on-disk override
+	if len(expected.SessionStart) == 0 {
+		t.Error("on-disk SessionStart override should be present")
+	} else if expected.SessionStart[0].Hooks[0].Command != "custom-mayor-session" {
+		t.Errorf("expected custom-mayor-session, got %q", expected.SessionStart[0].Hooks[0].Command)
 	}
 }
 
@@ -460,6 +793,22 @@ func TestLoadSettings(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsIntegrityError(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "settings.json")
+	if err := os.WriteFile(path, []byte(`{"hooks":{"SessionStart":"bad"}}`), 0644); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	_, err := LoadSettings(path)
+	if err == nil {
+		t.Fatal("expected integrity error for malformed settings")
+	}
+	if !IsSettingsIntegrityError(err) {
+		t.Fatalf("expected SettingsIntegrityError, got %T: %v", err, err)
+	}
+}
+
 func TestDiscoverTargets(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -474,8 +823,8 @@ func TestDiscoverTargets(t *testing.T) {
 		t.Fatalf("DiscoverTargets failed: %v", err)
 	}
 
-	if len(targets) < 5 {
-		t.Errorf("expected at least 5 targets, got %d", len(targets))
+	if len(targets) < 4 {
+		t.Errorf("expected at least 4 targets, got %d", len(targets))
 		for _, tgt := range targets {
 			t.Logf("  target: %s (key=%s)", tgt.DisplayKey(), tgt.Key)
 		}
@@ -489,6 +838,48 @@ func TestDiscoverTargets(t *testing.T) {
 	for _, expected := range []string{"mayor", "deacon", "testrig/crew", "testrig/witness"} {
 		if !found[expected] {
 			t.Errorf("expected target %q not found", expected)
+		}
+	}
+}
+
+func TestDiscoverTargets_RoleNames(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "crew", "alice"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "polecats", "toast"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "witness"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "refinery"), 0755)
+
+	targets, err := DiscoverTargets(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverTargets failed: %v", err)
+	}
+
+	// Verify Role field uses singular form (matching RoleSettingsDir conventions)
+	roleByKey := make(map[string]string)
+	for _, tgt := range targets {
+		roleByKey[tgt.Key] = tgt.Role
+	}
+
+	expected := map[string]string{
+		"mayor":         "mayor",
+		"deacon":        "deacon",
+		"rig1/crew":     "crew",
+		"rig1/polecats": "polecat",
+		"rig1/witness":  "witness",
+		"rig1/refinery": "refinery",
+	}
+
+	for key, wantRole := range expected {
+		gotRole, ok := roleByKey[key]
+		if !ok {
+			t.Errorf("target %q not found", key)
+			continue
+		}
+		if gotRole != wantRole {
+			t.Errorf("target %q: Role = %q, want %q", key, gotRole, wantRole)
 		}
 	}
 }

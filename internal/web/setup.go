@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,36 +15,50 @@ import (
 )
 
 // SetupHandler handles the setup flow when no workspace exists.
-type SetupHandler struct{}
-
-// NewSetupHandler creates a new setup handler.
-func NewSetupHandler() *SetupHandler {
-	return &SetupHandler{}
+type SetupHandler struct {
+	csrfToken string
 }
 
-// ServeHTTP renders the setup page.
+// NewSetupHandler creates a new setup handler with the given CSRF token.
+func NewSetupHandler(csrfToken string) *SetupHandler {
+	return &SetupHandler{csrfToken: csrfToken}
+}
+
+// ServeHTTP renders the setup page with the CSRF token injected.
 func (h *SetupHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(setupHTML))
+	html := strings.Replace(setupHTML, "<!--CSRF_TOKEN-->", h.csrfToken, 1)
+	_, _ = w.Write([]byte(html))
 }
 
 // SetupAPIHandler handles API requests for setup operations.
-type SetupAPIHandler struct{}
+type SetupAPIHandler struct {
+	csrfToken string
+}
 
-// NewSetupAPIHandler creates a new setup API handler.
-func NewSetupAPIHandler() *SetupAPIHandler {
-	return &SetupAPIHandler{}
+// NewSetupAPIHandler creates a new setup API handler with the given CSRF token.
+func NewSetupAPIHandler(csrfToken string) *SetupAPIHandler {
+	if csrfToken == "" {
+		log.Printf("WARNING: SetupAPIHandler created with empty CSRF token — POST requests will not be protected")
+	}
+	return &SetupAPIHandler{csrfToken: csrfToken}
 }
 
 // ServeHTTP routes setup API requests.
 func (h *SetupAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	// No CORS headers — the setup page is served from the same origin.
 
 	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	// Validate CSRF token on all POST requests.
+	if r.Method == http.MethodPost && h.csrfToken != "" {
+		if r.Header.Get("X-Dashboard-Token") != h.csrfToken {
+			h.sendError(w, "Invalid or missing dashboard token", http.StatusForbidden)
+			return
+		}
 	}
 
 	path := strings.TrimPrefix(r.URL.Path, "/api")
@@ -116,20 +131,31 @@ func (h *SetupAPIHandler) handleInstall(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Expand ~ to home directory
-	if strings.HasPrefix(req.Path, "~/") {
-		home, _ := os.UserHomeDir()
-		req.Path = filepath.Join(home, req.Path[2:])
+	// Expand ~ to home directory (with path cleaning to prevent traversal).
+	// Absolute paths (e.g., /opt/workspace) are intentionally allowed —
+	// this is a localhost-only dashboard and users may install workspaces anywhere.
+	expanded, err := expandHomePath(req.Path)
+	if err != nil {
+		log.Printf("handleInstall: expandHomePath(%q) failed: %v", req.Path, err)
+		h.sendError(w, "Invalid path", http.StatusBadRequest)
+		return
 	}
+	req.Path = expanded
 
-	// Build gt install command
-	args := []string{"install", req.Path}
+	// Build gt install command. Flags go first, then -- to end flag parsing,
+	// then the positional path (prevents paths like "--help" being parsed as flags).
+	args := []string{"install"}
 	if req.Name != "" {
+		if !isValidID(req.Name) {
+			h.sendError(w, "Invalid workspace name format", http.StatusBadRequest)
+			return
+		}
 		args = append(args, "--name", req.Name)
 	}
 	if req.Git {
 		args = append(args, "--git")
 	}
+	args = append(args, "--", req.Path)
 
 	output, err := h.runGtCommand(r.Context(), 60*time.Second, args)
 	if err != nil {
@@ -159,8 +185,17 @@ func (h *SetupAPIHandler) handleRigAdd(w http.ResponseWriter, r *http.Request) {
 		h.sendError(w, "Name and gitUrl are required", http.StatusBadRequest)
 		return
 	}
+	if !isValidRigName(req.Name) {
+		h.sendError(w, "Invalid rig name format (alphanumeric and underscores only, no hyphens or dots)", http.StatusBadRequest)
+		return
+	}
+	if !isValidGitURL(req.GitURL) {
+		h.sendError(w, "Git URL must be https://, http://, ssh://, git://, or git@host:path format", http.StatusBadRequest)
+		return
+	}
 
-	args := []string{"rig", "add", req.Name, req.GitURL}
+	// Flags before --, positional args after (consistent with handleInstall/handleIssueCreate).
+	args := []string{"rig", "add", "--", req.Name, req.GitURL}
 
 	output, err := h.runGtCommand(r.Context(), 120*time.Second, args)
 	if err != nil {
@@ -191,16 +226,22 @@ func (h *SetupAPIHandler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Expand ~ to home directory
-	path := req.Path
-	if strings.HasPrefix(path, "~/") {
-		home, _ := os.UserHomeDir()
-		path = filepath.Join(home, path[2:])
+	// Expand ~ to home directory (with path cleaning to prevent traversal)
+	path, err := expandHomePath(req.Path)
+	if err != nil {
+		log.Printf("handleLaunch: expandHomePath(%q) failed: %v", req.Path, err)
+		h.sendError(w, "Invalid path", http.StatusBadRequest)
+		return
 	}
 
 	port := req.Port
 	if port == 0 {
 		port = 8080
+	}
+	// Upper bound is 65534 (not 65535) to reserve room for newPort = port + 1
+	if port < 1 || port > 65534 {
+		h.sendError(w, "Port must be between 1 and 65534", http.StatusBadRequest)
+		return
 	}
 
 	// Use PATH lookup for gt binary. Do NOT use os.Executable() here - during
@@ -259,11 +300,14 @@ func (h *SetupAPIHandler) handleCheckWorkspace(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Expand ~ to home directory
-	path := req.Path
-	if strings.HasPrefix(path, "~/") {
-		home, _ := os.UserHomeDir()
-		path = filepath.Join(home, path[2:])
+	// Expand ~ to home directory (with path cleaning to prevent traversal)
+	path, err := expandHomePath(req.Path)
+	if err != nil {
+		// Return 200 with Valid:false (not 400) because this is a "check" endpoint
+		// that reports validity status, unlike mutating endpoints that return 400 on bad input.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CheckWorkspaceResponse{Valid: false, Message: "Invalid path format"})
+		return
 	}
 
 	// Check if mayor/ directory exists (indicates a Gas Town HQ)
@@ -359,8 +403,9 @@ func (h *SetupAPIHandler) sendJSON(w http.ResponseWriter, resp SetupResponse) {
 
 // NewSetupMux creates the HTTP handler for setup mode.
 func NewSetupMux() (http.Handler, error) {
-	setupHandler := NewSetupHandler()
-	apiHandler := NewSetupAPIHandler()
+	csrfToken := generateCSRFToken()
+	setupHandler := NewSetupHandler(csrfToken)
+	apiHandler := NewSetupAPIHandler(csrfToken)
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/", apiHandler)
@@ -374,6 +419,7 @@ const setupHTML = `<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="dashboard-token" content="<!--CSRF_TOKEN-->">
     <title>Gas Town Setup</title>
     <style>
         :root {
@@ -768,6 +814,21 @@ const setupHTML = `<!DOCTYPE html>
     </div>
 
     <script>
+        // CSRF protection: inject token into all POST requests
+        (function() {
+            var orig = window.fetch;
+            var meta = document.querySelector('meta[name="dashboard-token"]');
+            var token = meta ? meta.getAttribute('content') : '';
+            window.fetch = function(url, opts) {
+                opts = opts || {};
+                if (opts.method && opts.method.toUpperCase() === 'POST' && token) {
+                    opts.headers = opts.headers || {};
+                    opts.headers['X-Dashboard-Token'] = token;
+                }
+                return orig.call(this, url, opts);
+            };
+        })();
+
         var workspacePath = '';
 
         function showMode(mode) {

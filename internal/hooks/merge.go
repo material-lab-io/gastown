@@ -1,12 +1,16 @@
 package hooks
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
 // MergeHooks merges a base config with applicable overrides for a target.
+// It does NOT incorporate built-in defaults from DefaultOverrides(); callers
+// that need the full production merge should use ComputeExpected() instead.
 //
 // Merge rules:
 //  1. Start with base hooks
@@ -43,7 +47,10 @@ func LoadAllOverrides() (map[string]*HooksConfig, error) {
 	dir := OverridesDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return overrides, nil // No overrides dir is fine
+		if errors.Is(err, os.ErrNotExist) {
+			return overrides, nil // No overrides dir is fine
+		}
+		return nil, fmt.Errorf("reading overrides directory %s: %w", dir, err)
 	}
 
 	for _, entry := range entries {
@@ -57,7 +64,8 @@ func LoadAllOverrides() (map[string]*HooksConfig, error) {
 
 		cfg, err := loadConfig(filepath.Join(dir, name))
 		if err != nil {
-			continue // Skip invalid files
+			fmt.Fprintf(os.Stderr, "Warning: skipping invalid hooks override %s: %v\n", name, err)
+			continue
 		}
 		overrides[key] = cfg
 	}
@@ -73,6 +81,8 @@ func applyOverride(result, override *HooksConfig) *HooksConfig {
 	result.Stop = mergeEntries(result.Stop, override.Stop)
 	result.PreCompact = mergeEntries(result.PreCompact, override.PreCompact)
 	result.UserPromptSubmit = mergeEntries(result.UserPromptSubmit, override.UserPromptSubmit)
+	result.WorktreeCreate = mergeEntries(result.WorktreeCreate, override.WorktreeCreate)
+	result.WorktreeRemove = mergeEntries(result.WorktreeRemove, override.WorktreeRemove)
 	return result
 }
 
@@ -128,6 +138,8 @@ func cloneConfig(cfg *HooksConfig) *HooksConfig {
 		Stop:             cloneEntries(cfg.Stop),
 		PreCompact:       cloneEntries(cfg.PreCompact),
 		UserPromptSubmit: cloneEntries(cfg.UserPromptSubmit),
+		WorktreeCreate:   cloneEntries(cfg.WorktreeCreate),
+		WorktreeRemove:   cloneEntries(cfg.WorktreeRemove),
 	}
 }
 

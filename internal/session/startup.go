@@ -7,11 +7,29 @@ import (
 	"time"
 )
 
+// BeaconRecipient formats a human-readable, non-path-like recipient for the
+// startup beacon. Uses "role name (rig: rigName)" format to prevent LLMs from
+// misinterpreting the recipient as a filesystem path and constructing wrong
+// cd commands. See github.com/steveyegge/gastown/issues/1716.
+func BeaconRecipient(role, name, rig string) string {
+	if name != "" && rig != "" {
+		return fmt.Sprintf("%s %s (rig: %s)", role, name, rig)
+	}
+	if name != "" {
+		return fmt.Sprintf("%s %s", role, name)
+	}
+	if rig != "" {
+		return fmt.Sprintf("%s (rig: %s)", role, rig)
+	}
+	return role
+}
+
 // BeaconConfig configures a startup beacon message.
 // The beacon is injected into the CLI prompt to identify sessions in /resume picker.
 type BeaconConfig struct {
 	// Recipient is the address of the agent being nudged.
-	// Examples: "gastown/crew/gus", "deacon", "gastown/witness"
+	// Use BeaconRecipient() to format non-path-like addresses.
+	// Examples: "polecat rust (rig: gastown)", "deacon", "witness (rig: gastown)"
 	Recipient string
 
 	// Sender is the agent initiating the nudge.
@@ -85,11 +103,12 @@ func FormatStartupBeacon(cfg BeaconConfig) string {
 			"4. If nothing hooked → wait for instructions"
 	}
 
-	// For assigned, work is already on the hook - just tell them to run it
-	// This prevents the "helpful assistant" exploration pattern (see PRIMING.md)
+	// For assigned, tell agent to prime then work on the hook.
+	// Prime must come first so the agent gets full role context (formula, commands, etc).
+	// Matches refinery pattern: short instruction with prime before action.
 	// Exclude work instructions only if explicitly set (non-hook agents get them via delayed nudge)
 	if cfg.Topic == "assigned" && !cfg.ExcludeWorkInstructions {
-		beacon += "\n\nWork is on your hook. Run `" + cli.Name() + " hook` now and begin immediately."
+		beacon += "\n\nRun `" + cli.Name() + " prime --hook` and begin work on your hook."
 	}
 
 	return beacon

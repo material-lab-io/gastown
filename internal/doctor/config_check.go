@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/constants"
@@ -508,96 +509,46 @@ func (c *SessionHookCheck) usesSessionStartScript(content, hookType string) bool
 }
 
 // findSettingsFiles finds all settings.json files in the town.
+// Settings are installed in gastown-managed parent directories and passed via --settings flag.
 func (c *SessionHookCheck) findSettingsFiles(townRoot string) []string {
 	var files []string
 
-	// Town root
-	townSettings := filepath.Join(townRoot, ".claude", "settings.json")
-	if _, err := os.Stat(townSettings); err == nil {
-		files = append(files, townSettings)
+	// Town-level agents: mayor and deacon (settings in their own dir)
+	mayorSettings := filepath.Join(townRoot, "mayor", ".claude", "settings.json")
+	if _, err := os.Stat(mayorSettings); err == nil {
+		files = append(files, mayorSettings)
 	}
 
-	// Town-level agents (mayor, deacon) - these are not rigs but have their own settings
-	for _, agent := range []string{"mayor", "deacon"} {
-		agentSettings := filepath.Join(townRoot, agent, ".claude", "settings.json")
-		if _, err := os.Stat(agentSettings); err == nil {
-			files = append(files, agentSettings)
-		}
+	deaconSettings := filepath.Join(townRoot, "deacon", ".claude", "settings.json")
+	if _, err := os.Stat(deaconSettings); err == nil {
+		files = append(files, deaconSettings)
 	}
 
 	// Find all rigs
 	rigs := findAllRigs(townRoot)
 	for _, rig := range rigs {
-		// Rig root
-		rigSettings := filepath.Join(rig, ".claude", "settings.json")
-		if _, err := os.Stat(rigSettings); err == nil {
-			files = append(files, rigSettings)
-		}
-
-		// Mayor/rig
-		mayorRigSettings := filepath.Join(rig, "mayor", "rig", ".claude", "settings.json")
-		if _, err := os.Stat(mayorRigSettings); err == nil {
-			files = append(files, mayorRigSettings)
-		}
-
-		// Witness
+		// Witness - settings in parent directory (witness/)
 		witnessSettings := filepath.Join(rig, "witness", ".claude", "settings.json")
 		if _, err := os.Stat(witnessSettings); err == nil {
 			files = append(files, witnessSettings)
 		}
 
-		// Witness/rig
-		witnessRigSettings := filepath.Join(rig, "witness", "rig", ".claude", "settings.json")
-		if _, err := os.Stat(witnessRigSettings); err == nil {
-			files = append(files, witnessRigSettings)
-		}
-
-		// Refinery
+		// Refinery - settings in parent directory (refinery/)
 		refinerySettings := filepath.Join(rig, "refinery", ".claude", "settings.json")
 		if _, err := os.Stat(refinerySettings); err == nil {
 			files = append(files, refinerySettings)
 		}
 
-		// Refinery/rig
-		refineryRigSettings := filepath.Join(rig, "refinery", "rig", ".claude", "settings.json")
-		if _, err := os.Stat(refineryRigSettings); err == nil {
-			files = append(files, refineryRigSettings)
+		// Crew - shared settings in parent directory (crew/)
+		crewSettings := filepath.Join(rig, "crew", ".claude", "settings.json")
+		if _, err := os.Stat(crewSettings); err == nil {
+			files = append(files, crewSettings)
 		}
 
-		// Crew members
-		crewPath := filepath.Join(rig, "crew")
-		if crewEntries, err := os.ReadDir(crewPath); err == nil {
-			for _, crew := range crewEntries {
-				if crew.IsDir() && !strings.HasPrefix(crew.Name(), ".") {
-					crewSettings := filepath.Join(crewPath, crew.Name(), ".claude", "settings.json")
-					if _, err := os.Stat(crewSettings); err == nil {
-						files = append(files, crewSettings)
-					}
-				}
-			}
-		}
-
-		// Polecats (handle both new and old structures)
-		// New structure: polecats/<name>/<rigname>/.claude/settings.json
-		// Old structure: polecats/<name>/.claude/settings.json
-		rigName := filepath.Base(rig)
-		polecatsPath := filepath.Join(rig, "polecats")
-		if polecatEntries, err := os.ReadDir(polecatsPath); err == nil {
-			for _, polecat := range polecatEntries {
-				if polecat.IsDir() && !strings.HasPrefix(polecat.Name(), ".") {
-					// Try new structure first
-					polecatSettings := filepath.Join(polecatsPath, polecat.Name(), rigName, ".claude", "settings.json")
-					if _, err := os.Stat(polecatSettings); err == nil {
-						files = append(files, polecatSettings)
-					} else {
-						// Fall back to old structure
-						polecatSettings = filepath.Join(polecatsPath, polecat.Name(), ".claude", "settings.json")
-						if _, err := os.Stat(polecatSettings); err == nil {
-							files = append(files, polecatSettings)
-						}
-					}
-				}
-			}
+		// Polecats - shared settings in parent directory (polecats/)
+		polecatSettings := filepath.Join(rig, "polecats", ".claude", "settings.json")
+		if _, err := os.Stat(polecatSettings); err == nil {
+			files = append(files, polecatSettings)
 		}
 	}
 
@@ -694,7 +645,7 @@ func (c *CustomTypesCheck) Run(ctx *CheckContext) *CheckResult {
 
 	// Get current custom types configuration
 	// Use Output() not CombinedOutput() to avoid capturing bd's stderr messages
-	cmd := exec.Command("bd", "--no-daemon", "config", "get", "types.custom")
+	cmd := exec.Command("bd", "config", "get", "types.custom")
 	cmd.Dir = ctx.TownRoot
 	output, err := cmd.Output()
 	if err != nil {
@@ -767,11 +718,142 @@ func parseConfigOutput(output []byte) string {
 
 // Fix registers the missing custom types.
 func (c *CustomTypesCheck) Fix(ctx *CheckContext) error {
-	cmd := exec.Command("bd", "--no-daemon", "config", "set", "types.custom", constants.BeadsCustomTypes)
+	cmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
 	cmd.Dir = c.townRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("bd config set types.custom: %s", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// CustomStatusesCheck verifies Gas Town custom statuses are registered with beads.
+type CustomStatusesCheck struct {
+	FixableCheck
+	missingStatuses []string // Cached during Run for use in Fix
+	townRoot        string   // Cached during Run for use in Fix
+}
+
+// NewCustomStatusesCheck creates a new custom statuses check.
+func NewCustomStatusesCheck() *CustomStatusesCheck {
+	return &CustomStatusesCheck{
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "beads-custom-statuses",
+				CheckDescription: "Check that Gas Town custom statuses are registered with beads",
+				CheckCategory:    CategoryConfig,
+			},
+		},
+	}
+}
+
+// Run checks if custom statuses are properly configured.
+func (c *CustomStatusesCheck) Run(ctx *CheckContext) *CheckResult {
+	if _, err := exec.LookPath("bd"); err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "beads not installed (skipped)",
+		}
+	}
+
+	townBeadsDir := filepath.Join(ctx.TownRoot, ".beads")
+	if _, err := os.Stat(townBeadsDir); os.IsNotExist(err) {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No beads database (skipped)",
+		}
+	}
+
+	// Get current custom statuses configuration
+	cmd := exec.Command("bd", "config", "get", "status.custom")
+	cmd.Dir = ctx.TownRoot
+	output, err := cmd.Output()
+	if err != nil {
+		c.townRoot = ctx.TownRoot
+		c.missingStatuses = constants.BeadsCustomStatusesList()
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusWarning,
+			Message: "Custom statuses not configured",
+			Details: []string{
+				"Gas Town custom statuses (staged_ready, staged_warnings) are not registered",
+				"Convoy staging will fail without these statuses",
+			},
+			FixHint: "Run 'gt doctor --fix' or 'bd config set status.custom \"" + constants.BeadsCustomStatuses + "\"'",
+		}
+	}
+
+	configuredStatuses := parseConfigOutput(output)
+	configuredSet := make(map[string]bool)
+	for _, s := range strings.Split(configuredStatuses, ",") {
+		configuredSet[strings.TrimSpace(s)] = true
+	}
+
+	var missing []string
+	for _, required := range constants.BeadsCustomStatusesList() {
+		if !configuredSet[required] {
+			missing = append(missing, required)
+		}
+	}
+
+	if len(missing) == 0 {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "All custom statuses registered",
+		}
+	}
+
+	c.townRoot = ctx.TownRoot
+	c.missingStatuses = missing
+
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  StatusWarning,
+		Message: fmt.Sprintf("%d custom status(es) missing", len(missing)),
+		Details: []string{
+			fmt.Sprintf("Missing statuses: %s", strings.Join(missing, ", ")),
+			fmt.Sprintf("Configured: %s", configuredStatuses),
+			fmt.Sprintf("Required: %s", constants.BeadsCustomStatuses),
+		},
+		FixHint: "Run 'gt doctor --fix' to register missing statuses",
+	}
+}
+
+// Fix registers the missing custom statuses by merging with existing ones.
+func (c *CustomStatusesCheck) Fix(ctx *CheckContext) error {
+	// Read existing statuses
+	getCmd := exec.Command("bd", "config", "get", "status.custom")
+	getCmd.Dir = c.townRoot
+	existingOutput, _ := getCmd.Output()
+
+	// Build merged set
+	statusSet := make(map[string]bool)
+	if existing := strings.TrimSpace(string(existingOutput)); existing != "" {
+		for _, s := range strings.Split(parseConfigOutput(existingOutput), ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				statusSet[s] = true
+			}
+		}
+	}
+	for _, s := range constants.BeadsCustomStatusesList() {
+		statusSet[s] = true
+	}
+
+	var merged []string
+	for s := range statusSet {
+		merged = append(merged, s)
+	}
+	sort.Strings(merged)
+
+	cmd := exec.Command("bd", "config", "set", "status.custom", strings.Join(merged, ","))
+	cmd.Dir = c.townRoot
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("bd config set status.custom: %s", strings.TrimSpace(string(output)))
 	}
 	return nil
 }

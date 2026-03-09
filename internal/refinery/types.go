@@ -58,6 +58,68 @@ const (
 	MRClosed MRStatus = "closed"
 )
 
+// Extended MR statuses for the v2 state machine.
+// These are stored in the MR bead's checkpoint/claim fields, not in the
+// beads status field (which remains open/in_progress/closed for compatibility).
+type MRPhase string
+
+const (
+	// MRPhaseReady means the MR is queued and available for claiming.
+	MRPhaseReady MRPhase = "ready"
+
+	// MRPhaseClaimed means a refinery instance has claimed the MR for processing.
+	MRPhaseClaimed MRPhase = "claimed"
+
+	// MRPhasePreparing means quality gates are running (rebase, setup, tests).
+	MRPhasePreparing MRPhase = "preparing"
+
+	// MRPhasePrepared means quality gates completed (may have failed — needs diagnosis).
+	MRPhasePrepared MRPhase = "prepared"
+
+	// MRPhaseMerging means the merge is in progress (ff-merge + push).
+	MRPhaseMerging MRPhase = "merging"
+
+	// MRPhaseMerged means the MR was successfully merged to target.
+	MRPhaseMerged MRPhase = "merged"
+
+	// MRPhaseRejected means the MR was rejected after diagnosis.
+	MRPhaseRejected MRPhase = "rejected"
+
+	// MRPhaseFailed means a transient error occurred (eligible for retry).
+	MRPhaseFailed MRPhase = "failed"
+)
+
+// ValidPhaseTransitions defines the allowed state transitions for MR phases.
+var ValidPhaseTransitions = map[MRPhase][]MRPhase{
+	MRPhaseReady:     {MRPhaseClaimed},
+	MRPhaseClaimed:   {MRPhasePreparing, MRPhaseReady},
+	MRPhasePreparing: {MRPhasePrepared, MRPhaseFailed},
+	MRPhasePrepared:  {MRPhaseMerging, MRPhaseRejected, MRPhaseReady},
+	MRPhaseMerging:   {MRPhaseMerged, MRPhaseFailed},
+	MRPhaseFailed:    {MRPhaseReady},
+	// Terminal states: MRPhaseMerged, MRPhaseRejected (no transitions out)
+}
+
+// ValidatePhaseTransition checks if a phase transition is allowed.
+func ValidatePhaseTransition(from, to MRPhase) error {
+	if from == to {
+		return nil
+	}
+	allowed, ok := ValidPhaseTransitions[from]
+	if !ok {
+		return fmt.Errorf("%w: %s is a terminal state", ErrInvalidTransition, from)
+	}
+	for _, target := range allowed {
+		if target == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s → %s is not allowed", ErrInvalidTransition, from, to)
+}
+
+// DefaultClaimTTLMinutes is the default TTL for MR claims.
+const DefaultClaimTTLMinutes = 30
+
 // CloseReason indicates why a merge request was closed.
 type CloseReason string
 
@@ -75,47 +137,11 @@ const (
 	CloseReasonSuperseded CloseReason = "superseded"
 )
 
-
-// MergeConfig contains configuration for the merge process.
-type MergeConfig struct {
-	// RunTests controls whether tests are run after merge.
-	// Default: true
-	RunTests bool `json:"run_tests"`
-
-	// TestCommand is the command to run for testing.
-	// Default: "go test ./..."
-	TestCommand string `json:"test_command"`
-
-	// DeleteMergedBranches controls whether merged branches are deleted.
-	// Default: true
-	DeleteMergedBranches bool `json:"delete_merged_branches"`
-
-	// PushRetryCount is the number of times to retry a failed push.
-	// Default: 3
-	PushRetryCount int `json:"push_retry_count"`
-
-	// PushRetryDelayMs is the base delay between push retries in milliseconds.
-	// Each retry doubles the delay (exponential backoff).
-	// Default: 1000
-	PushRetryDelayMs int `json:"push_retry_delay_ms"`
-}
-
-// DefaultMergeConfig returns the default merge configuration.
-func DefaultMergeConfig() MergeConfig {
-	return MergeConfig{
-		RunTests:             true,
-		TestCommand:          "go test ./...",
-		DeleteMergedBranches: true,
-		PushRetryCount:       3,
-		PushRetryDelayMs:     1000,
-	}
-}
-
 // QueueItem represents an item in the merge queue for display.
 type QueueItem struct {
-	Position  int       `json:"position"`
-	MR        *MergeRequest `json:"mr"`
-	Age       string    `json:"age"`
+	Position int           `json:"position"`
+	MR       *MergeRequest `json:"mr"`
+	Age      string        `json:"age"`
 }
 
 // State transition errors.

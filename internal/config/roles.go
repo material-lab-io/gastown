@@ -73,6 +73,11 @@ type RoleHealthConfig struct {
 
 	// StuckThreshold is how long a wisp can be in_progress before considered stuck.
 	StuckThreshold Duration `toml:"stuck_threshold"`
+
+	// HungSessionThreshold is how long a tmux session can be inactive before
+	// considered hung. Overrides constants.HungSessionThreshold per role.
+	// Zero means use the default from constants.
+	HungSessionThreshold Duration `toml:"hung_session_threshold"`
 }
 
 // Duration is a wrapper for time.Duration that supports TOML marshaling.
@@ -147,14 +152,22 @@ func LoadRoleDefinition(townRoot, rigPath, roleName string) (*RoleDefinition, er
 
 	// 2. Apply town-level overrides if present
 	townOverridePath := filepath.Join(townRoot, "roles", roleName+".toml")
-	if override, err := loadRoleOverride(townOverridePath); err == nil {
+	if override, err := loadRoleOverride(townOverridePath); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("town-level role override %s: %w", townOverridePath, err)
+		}
+	} else {
 		mergeRoleDefinition(def, override)
 	}
 
 	// 3. Apply rig-level overrides if present (only for rig-scoped roles)
 	if rigPath != "" {
 		rigOverridePath := filepath.Join(rigPath, "roles", roleName+".toml")
-		if override, err := loadRoleOverride(rigOverridePath); err == nil {
+		if override, err := loadRoleOverride(rigOverridePath); err != nil {
+			if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("rig-level role override %s: %w", rigOverridePath, err)
+			}
+		} else {
 			mergeRoleDefinition(def, override)
 		}
 	}
@@ -246,6 +259,9 @@ func mergeRoleDefinition(base, override *RoleDefinition) {
 	if override.Health.StuckThreshold.Duration != 0 {
 		base.Health.StuckThreshold = override.Health.StuckThreshold
 	}
+	if override.Health.HungSessionThreshold.Duration != 0 {
+		base.Health.HungSessionThreshold = override.Health.HungSessionThreshold
+	}
 
 	// Prompts
 	if override.Nudge != "" {
@@ -257,42 +273,14 @@ func mergeRoleDefinition(base, override *RoleDefinition) {
 }
 
 // ExpandPattern expands placeholders in a pattern string.
-// Supported placeholders: {town}, {rig}, {name}, {role}
-func ExpandPattern(pattern, townRoot, rig, name, role string) string {
+// Supported placeholders: {town}, {rig}, {name}, {role}, {prefix}
+func ExpandPattern(pattern, townRoot, rig, name, role, prefix string) string {
 	result := pattern
 	result = strings.ReplaceAll(result, "{town}", townRoot)
 	result = strings.ReplaceAll(result, "{rig}", rig)
 	result = strings.ReplaceAll(result, "{name}", name)
 	result = strings.ReplaceAll(result, "{role}", role)
+	result = strings.ReplaceAll(result, "{prefix}", prefix)
 	return result
 }
 
-// ToLegacyRoleConfig converts a RoleDefinition to the legacy RoleConfig format
-// for backward compatibility with existing daemon code.
-func (rd *RoleDefinition) ToLegacyRoleConfig() *LegacyRoleConfig {
-	return &LegacyRoleConfig{
-		SessionPattern:      rd.Session.Pattern,
-		WorkDirPattern:      rd.Session.WorkDir,
-		NeedsPreSync:        rd.Session.NeedsPreSync,
-		StartCommand:        rd.Session.StartCommand,
-		EnvVars:             rd.Env,
-		PingTimeout:         rd.Health.PingTimeout.String(),
-		ConsecutiveFailures: rd.Health.ConsecutiveFailures,
-		KillCooldown:        rd.Health.KillCooldown.String(),
-		StuckThreshold:      rd.Health.StuckThreshold.String(),
-	}
-}
-
-// LegacyRoleConfig matches the old beads.RoleConfig struct for compatibility.
-// This allows gradual migration without breaking existing code.
-type LegacyRoleConfig struct {
-	SessionPattern      string
-	WorkDirPattern      string
-	NeedsPreSync        bool
-	StartCommand        string
-	EnvVars             map[string]string
-	PingTimeout         string
-	ConsecutiveFailures int
-	KillCooldown        string
-	StuckThreshold      string
-}

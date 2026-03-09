@@ -43,7 +43,7 @@ bd mol wisp towers-of-hanoi-7 --json | jq -r '.new_epic_id'
 bd list --parent=gt-eph-xxx --limit=200 --json | jq -r '.[].id' > /tmp/ids.txt
 
 # Close all issues (serial)
-while read id; do bd --no-daemon close "$id" >/dev/null; done < /tmp/ids.txt
+while read id; do bd close "$id" >/dev/null; done < /tmp/ids.txt
 
 # Burn the wisp (cleanup)
 bd mol burn gt-eph-xxx --force
@@ -62,7 +62,7 @@ wc -l /tmp/ids.txt  # Should show 1025
 
 # Time the execution
 START=$(date +%s)
-while read id; do bd --no-daemon close "$id" >/dev/null 2>&1; done < /tmp/ids.txt
+while read id; do bd close "$id" >/dev/null 2>&1; done < /tmp/ids.txt
 END=$(date +%s)
 echo "Completed in $((END - START)) seconds"
 
@@ -77,7 +77,7 @@ bd mol burn $WISP --force
 
 The demo uses wisps (ephemeral molecules) because:
 
-1. **No Git Pollution**: Wisps don't sync to JSONL, keeping git history clean
+1. **No Git Pollution**: Wisps are database-only, keeping git history clean
 2. **Auto-Cleanup**: Wisps can be burned without leaving tombstones
 3. **Speed**: No export overhead during rapid closes
 4. **Appropriate Semantics**: This is operational testing, not auditable work
@@ -110,7 +110,7 @@ provide hierarchy only - they don't block execution.
 
 ### Close Speed
 
-With `bd --no-daemon close`:
+With `bd close`:
 - ~109ms per close (serial)
 - ~9 closes/second
 

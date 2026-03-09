@@ -12,12 +12,51 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/lock"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // minOrphanAge is the minimum age (in seconds) a process must be before
 // we consider it orphaned. This prevents race conditions with newly spawned
 // processes and avoids killing legitimate short-lived subagents.
 const minOrphanAge = 60
+
+// buildChildMap builds a parent→children map from a single ps call.
+// This replaces per-PID pgrep calls, reducing O(N) process spawns to O(1).
+func buildChildMap() map[int][]int {
+	children := make(map[int][]int)
+	out, err := exec.Command("ps", "-eo", "pid,ppid").Output()
+	if err != nil {
+		return children
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		if pid > 0 {
+			children[ppid] = append(children[ppid], pid)
+		}
+	}
+	return children
+}
+
+// addDescendants adds all descendant PIDs of a process to the set using
+// a pre-built child map (no additional process spawns).
+func addDescendants(parentPID int, childMap map[int][]int, pids map[int]bool) {
+	for _, pid := range childMap[parentPID] {
+		if !pids[pid] {
+			pids[pid] = true
+			addDescendants(pid, childMap, pids)
+		}
+	}
+}
 
 // getTmuxSessionPIDs returns a set of PIDs belonging to ANY tmux session.
 // This prevents killing Claude processes that are running in tmux sessions,
@@ -31,10 +70,13 @@ func getTmuxSessionPIDs() map[int]bool {
 	pids := make(map[int]bool)
 
 	// Get list of ALL tmux sessions (not just gt-*/hq-*)
-	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	out, err := tmux.BuildCommand("list-sessions", "-F", "#{session_name}").Output()
 	if err != nil {
 		return pids // tmux not available or no sessions
 	}
+
+	// Build process tree once, used for all pane PIDs
+	childMap := buildChildMap()
 
 	// Protect ALL sessions - user's personal sessions are just as important
 	sessions := strings.Split(strings.TrimSpace(string(out)), "\n")
@@ -44,7 +86,7 @@ func getTmuxSessionPIDs() map[int]bool {
 		if session == "" {
 			continue
 		}
-		out, err := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_pid}").Output()
+		out, err := tmux.BuildCommand("list-panes", "-t", session, "-F", "#{pane_pid}").Output()
 		if err != nil {
 			continue
 		}
@@ -52,64 +94,12 @@ func getTmuxSessionPIDs() map[int]bool {
 			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
 				pids[pid] = true
 				// Also add child processes of the pane shell
-				addChildPIDs(pid, pids)
+				addDescendants(pid, childMap, pids)
 			}
 		}
 	}
 
 	return pids
-}
-
-// addChildPIDs adds all descendant PIDs of a process to the set.
-// This catches Claude processes spawned by the shell in a tmux pane.
-func addChildPIDs(parentPID int, pids map[int]bool) {
-	childPIDs := getChildPIDs(parentPID)
-	for _, pid := range childPIDs {
-		pids[pid] = true
-		// Recurse to get grandchildren
-		addChildPIDs(pid, pids)
-	}
-}
-
-// getChildPIDs returns direct child PIDs of a process.
-// Tries pgrep first, falls back to parsing ps output.
-func getChildPIDs(parentPID int) []int {
-	var childPIDs []int
-
-	// Try pgrep first (faster, more reliable when available)
-	out, err := exec.Command("pgrep", "-P", strconv.Itoa(parentPID)).Output()
-	if err == nil {
-		for _, pidStr := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
-				childPIDs = append(childPIDs, pid)
-			}
-		}
-		return childPIDs
-	}
-
-	// Fallback: parse ps output to find children
-	// ps -eo pid,ppid gives us all processes with their parent PIDs
-	out, err = exec.Command("ps", "-eo", "pid,ppid").Output()
-	if err != nil {
-		return childPIDs
-	}
-
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		pid, err1 := strconv.Atoi(fields[0])
-		ppid, err2 := strconv.Atoi(fields[1])
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		if ppid == parentPID && pid > 0 {
-			childPIDs = append(childPIDs, pid)
-		}
-	}
-
-	return childPIDs
 }
 
 // sigkillGracePeriod is how long (in seconds) we wait after sending SIGTERM
@@ -139,17 +129,19 @@ func loadSignalState(filename string) map[int]signalState {
 	state := make(map[int]signalState)
 
 	path := filepath.Join(stateFileDir(), filename)
+
+	// Acquire coordination lock (serializes with saveSignalState)
+	unlock, err := lock.FlockAcquire(path + ".flock")
+	if err != nil {
+		return state
+	}
+	defer unlock()
+
 	f, err := os.Open(path)
 	if err != nil {
 		return state // File doesn't exist yet, that's fine
 	}
 	defer f.Close()
-
-	// Acquire shared lock for reading
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-		return state
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -180,17 +172,19 @@ func loadSignalState(filename string) map[int]signalState {
 // Uses file locking to prevent concurrent access.
 func saveSignalState(filename string, state map[int]signalState) error {
 	path := filepath.Join(stateFileDir(), filename)
+
+	// Acquire coordination lock (serializes with loadSignalState)
+	unlock, err := lock.FlockAcquire(path + ".flock")
+	if err != nil {
+		return fmt.Errorf("acquiring lock: %w", err)
+	}
+	defer unlock()
+
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	// Acquire exclusive lock for writing
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("acquiring lock: %w", err)
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
 
 	for pid, s := range state {
 		fmt.Fprintf(f, "%d %s %d\n", pid, s.Signal, s.Timestamp.Unix())
@@ -215,6 +209,93 @@ func saveOrphanState(state map[int]signalState) error {
 func processExists(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
+}
+
+// getProcessCwd returns the current working directory of a process.
+// On Linux, reads /proc/<pid>/cwd. On macOS and other Unix, uses lsof.
+// Returns empty string if the cwd cannot be determined.
+//
+// On hardened Linux kernels (Ubuntu default: kernel.yama.ptrace_scope=1),
+// readlink(/proc/<pid>/cwd) fails with EACCES for non-descendant same-user
+// processes. The lsof fallback handles this when lsof is installed (it may
+// be setuid or hold CAP_SYS_PTRACE). If neither method works, "" is returned
+// and the caller fails safe by not killing the process.
+func getProcessCwd(pid int) string {
+	pidStr := strconv.Itoa(pid)
+
+	// Try /proc/<pid>/cwd first (Linux).
+	// Fails on hardened kernels (ptrace_scope>=1) for non-descendant processes.
+	if target, err := os.Readlink(filepath.Join("/proc", pidStr, "cwd")); err == nil {
+		// Linux appends " (deleted)" when the directory has been removed.
+		// Strip it so the walk-up in isInGasTownWorkspace can still match
+		// the workspace root (the process is definitely orphaned if its
+		// workspace was nuked).
+		return strings.TrimSuffix(target, " (deleted)")
+	}
+
+	// Fallback: lsof (macOS, and Linux when /proc is restricted by ptrace_scope).
+	// -a is required to AND the -p and -d conditions; without it lsof ORs them.
+	// lsof may be setuid or have CAP_SYS_PTRACE, letting it succeed where
+	// readlink failed. Not installed by default on Alpine or minimal Ubuntu images.
+	out, err := exec.Command("lsof", "-a", "-p", pidStr, "-d", "cwd", "-Fn").Output()
+	if err != nil {
+		return ""
+	}
+	// lsof -Fn output: lines starting with 'p' (pid) and 'n' (name/path)
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "n") {
+			return line[1:]
+		}
+	}
+	return ""
+}
+
+// isInGasTownWorkspace checks whether a process's working directory is inside
+// a Gas Town workspace (identified by the mayor/town.json marker).
+// Returns true if the process cwd is at or under a Gas Town workspace root.
+// Returns false if the cwd cannot be determined or is not under any workspace.
+func isInGasTownWorkspace(pid int) bool {
+	cwd := getProcessCwd(pid)
+	if cwd == "" {
+		return false // Can't determine cwd; don't kill
+	}
+
+	// Walk up from cwd looking for a Gas Town workspace marker
+	current := cwd
+	for {
+		if _, err := os.Stat(filepath.Join(current, "mayor", "town.json")); err == nil {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+		current = parent
+	}
+}
+
+// isIDEClaudeProcess checks if a Claude process was spawned by an IDE extension
+// (VS Code, Cursor, etc.). IDE-launched Claude processes run with TTY "?" but
+// are legitimate — they're controlled by the IDE, not orphaned from dead sessions.
+func isIDEClaudeProcess(pid int) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return false
+	}
+	args := string(out)
+	// Check for IDE-specific paths in the executable
+	if strings.Contains(args, "vscode-server") ||
+		strings.Contains(args, "vscode/extensions") ||
+		strings.Contains(args, ".cursor-server") ||
+		strings.Contains(args, ".cursor/extensions") {
+		return true
+	}
+	// Generic IDE detection: stream-json I/O is specific to IDE extensions
+	if strings.Contains(args, "--output-format stream-json") &&
+		strings.Contains(args, "--input-format stream-json") {
+		return true
+	}
+	return false
 }
 
 // parseEtime parses ps etime format into seconds.
@@ -274,7 +355,7 @@ type OrphanedProcess struct {
 	Age int // Age in seconds
 }
 
-// FindOrphanedClaudeProcesses finds claude/codex processes without a controlling terminal.
+// FindOrphanedClaudeProcesses finds claude/codex/opencode processes without a controlling terminal.
 // These are typically subagent processes spawned by Claude Code's Task tool that didn't
 // clean up properly after completion.
 //
@@ -321,9 +402,9 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 			continue
 		}
 
-		// Match claude or codex command names
+		// Match claude, codex, or opencode command names
 		cmdLower := strings.ToLower(cmd)
-		if cmdLower != "claude" && cmdLower != "claude-code" && cmdLower != "codex" {
+		if cmdLower != "claude" && cmdLower != "claude-code" && cmdLower != "codex" && cmdLower != "opencode" {
 			continue
 		}
 
@@ -334,6 +415,12 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 			continue
 		}
 
+		// Skip IDE extension processes (VS Code, Cursor, etc.).
+		// These have TTY "?" but are legitimate — controlled by the IDE.
+		if isIDEClaudeProcess(pid) {
+			continue
+		}
+
 		// Skip processes younger than minOrphanAge seconds
 		// This prevents killing newly spawned subagents and reduces false positives
 		age, err := parseEtime(etimeStr)
@@ -341,6 +428,14 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 			continue
 		}
 		if age < minOrphanAge {
+			continue
+		}
+
+		// Skip processes NOT in a Gas Town workspace.
+		// Only kill orphaned Claude processes whose cwd is under a Gas Town
+		// workspace root. This prevents killing user's Claude Code instances
+		// running in repos outside ~/gt/ (or wherever the workspace is).
+		if !isInGasTownWorkspace(pid) {
 			continue
 		}
 
@@ -369,14 +464,10 @@ type ZombieProcess struct {
 	TTY string // TTY column from ps (may be "?" or a session like "s024")
 }
 
-// FindZombieClaudeProcesses finds Claude processes NOT in any active tmux session.
-// This catches "zombie" processes that have a TTY but whose tmux session is dead.
-//
-// Unlike FindOrphanedClaudeProcesses (which uses TTY="?" detection), this function
-// uses tmux pane verification: a process is a zombie if it's NOT the pane PID of
-// any active tmux session AND not a child of any pane PID.
-//
-// This is the definitive zombie check because it verifies against tmux reality.
+// FindZombieClaudeProcesses finds Claude processes with no TTY that are NOT in
+// any active tmux session. This catches "zombie" processes whose tmux session
+// has died. Processes with a real TTY (e.g. pts/*) are skipped because those
+// are interactive terminal sessions, not zombies.
 func FindZombieClaudeProcesses() ([]ZombieProcess, error) {
 	// Get ALL valid PIDs (panes + their children) from active tmux sessions
 	validPIDs := getTmuxSessionPIDs()
@@ -385,7 +476,7 @@ func FindZombieClaudeProcesses() ([]ZombieProcess, error) {
 	// Returning empty is safer than marking all Claude processes as zombies.
 	if len(validPIDs) == 0 {
 		// Check if tmux is even running
-		if err := exec.Command("tmux", "list-sessions").Run(); err != nil {
+		if err := tmux.BuildCommand("list-sessions").Run(); err != nil {
 			return nil, fmt.Errorf("tmux not available: %w", err)
 		}
 		// tmux is running but no gt-*/hq-* sessions - that's a valid state,
@@ -416,14 +507,27 @@ func FindZombieClaudeProcesses() ([]ZombieProcess, error) {
 		cmd := fields[2]
 		etimeStr := fields[3]
 
-		// Match claude or codex command names
+		// Match claude, codex, or opencode command names
 		cmdLower := strings.ToLower(cmd)
-		if cmdLower != "claude" && cmdLower != "claude-code" && cmdLower != "codex" {
+		if cmdLower != "claude" && cmdLower != "claude-code" && cmdLower != "codex" && cmdLower != "opencode" {
 			continue
 		}
 
 		// Skip processes that belong to valid Gas Town tmux sessions
 		if validPIDs[pid] {
+			continue
+		}
+
+		// Skip processes with a real TTY that are NOT in any tmux session.
+		// These are interactive terminal sessions (e.g. user running claude
+		// in a regular terminal), not zombies from dead tmux sessions.
+		if tty != "?" && tty != "??" {
+			continue
+		}
+
+		// Skip IDE extension processes (VS Code, Cursor, etc.).
+		// These have TTY "?" but are legitimate — controlled by the IDE.
+		if isIDEClaudeProcess(pid) {
 			continue
 		}
 
@@ -433,6 +537,14 @@ func FindZombieClaudeProcesses() ([]ZombieProcess, error) {
 			continue
 		}
 		if age < minOrphanAge {
+			continue
+		}
+
+		// Skip processes NOT in a Gas Town workspace.
+		// Only kill zombie Claude processes whose cwd is under a Gas Town
+		// workspace root. This prevents killing user's Claude Code instances
+		// running in repos outside ~/gt/.
+		if !isInGasTownWorkspace(pid) {
 			continue
 		}
 
@@ -539,6 +651,13 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 			continue
 		}
 
+		// TOCTOU guard: re-verify this process is still a zombie before signaling.
+		// Between FindZombieClaudeProcesses() and now, the process may have
+		// joined a tmux session or been adopted by an active session.
+		if !isProcessStillOrphaned(zombie.PID) {
+			continue
+		}
+
 		if err := syscall.Kill(zombie.PID, syscall.SIGTERM); err != nil {
 			if err != syscall.ESRCH {
 				lastErr = fmt.Errorf("SIGTERM PID %d: %w", zombie.PID, err)
@@ -640,6 +759,13 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 			continue // Already in state, waiting for grace period
 		}
 
+		// TOCTOU guard: re-verify this process is still orphaned before signaling.
+		// Between FindOrphanedClaudeProcesses() and now, the process may have
+		// joined a tmux session or acquired a TTY.
+		if !isProcessStillOrphaned(orphan.PID) {
+			continue
+		}
+
 		// New orphan - send SIGTERM
 		if err := syscall.Kill(orphan.PID, syscall.SIGTERM); err != nil {
 			if err != syscall.ESRCH {
@@ -662,4 +788,30 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 	}
 
 	return results, lastErr
+}
+
+// isProcessStillOrphaned re-checks whether a process is still orphaned/zombie.
+// Used for TOCTOU re-verification immediately before sending signals.
+// Returns true if the process still has no controlling terminal and is not
+// in any active tmux session (i.e., still safe to signal).
+func isProcessStillOrphaned(pid int) bool {
+	// Re-check the process TTY via ps
+	out, err := exec.Command("ps", "-o", "tty=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false // Process may have exited - not orphaned anymore
+	}
+
+	tty := strings.TrimSpace(string(out))
+	if tty == "" {
+		return false // Process gone
+	}
+
+	// If it now has a real TTY, it's been adopted
+	if tty != "?" && tty != "??" {
+		return false
+	}
+
+	// Re-check against current tmux session PIDs
+	protectedPIDs := getTmuxSessionPIDs()
+	return !protectedPIDs[pid]
 }

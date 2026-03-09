@@ -38,7 +38,7 @@ A special Dog that checks the Deacon every 5 minutes, ensuring the watchdog itse
 ## Rig-Level Roles
 
 ### Polecat
-Ephemeral worker agents that produce Merge Requests. Polecats are spawned for specific tasks, complete their work, and are then cleaned up. They work in isolated git worktrees to avoid conflicts.
+Worker agents with persistent identity but ephemeral sessions. Each polecat has a permanent agent bead, CV chain, and work history that accumulates across assignments. Sessions and sandboxes are ephemeral — spawned for specific tasks, cleaned up on completion — but the identity persists. They work in isolated git worktrees to avoid conflicts.
 
 ### Refinery
 Manages the Merge Queue for a Rig. The Refinery intelligently merges changes from Polecats, handling conflicts and ensuring code quality before changes reach the main branch.
@@ -52,7 +52,7 @@ Long-lived, named agents for persistent collaboration. Unlike ephemeral Polecats
 ## Work Units
 
 ### Bead
-Git-backed atomic work unit stored in JSONL format. Beads are the fundamental unit of work tracking in Gas Town. They can represent issues, tasks, epics, or any trackable work item.
+Git-backed atomic work unit stored in Dolt. Beads are the fundamental unit of work tracking in Gas Town. They can represent issues, tasks, epics, or any trackable work item.
 
 ### Formula
 TOML-based workflow source template. Formulas define reusable patterns for common operations like patrol cycles, code review, or deployment.

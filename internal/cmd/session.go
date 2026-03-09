@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/suggest"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -23,13 +24,14 @@ import (
 
 // Session command flags
 var (
-	sessionIssue     string
-	sessionForce     bool
-	sessionLines     int
-	sessionMessage   string
-	sessionFile      string
-	sessionRigFilter string
-	sessionListJSON  bool
+	sessionIssue      string
+	sessionForce      bool
+	sessionLines      int
+	sessionMessage    string
+	sessionFile       string
+	sessionRigFilter  string
+	sessionListJSON   bool
+	sessionStatusJSON bool
 )
 
 var sessionCmd = &cobra.Command{
@@ -187,6 +189,9 @@ func init() {
 	// Restart flags
 	sessionRestartCmd.Flags().BoolVarP(&sessionForce, "force", "f", false, "Force immediate shutdown")
 
+	// Status flags
+	sessionStatusCmd.Flags().BoolVar(&sessionStatusJSON, "json", false, "Output as JSON")
+
 	// Add subcommands
 	sessionCmd.AddCommand(sessionStartCmd)
 	sessionCmd.AddCommand(sessionStopCmd)
@@ -257,7 +262,7 @@ func runSessionStart(cmd *cobra.Command, args []string) error {
 	}
 	if !found {
 		suggestions := suggest.FindSimilar(polecatName, r.Polecats, 3)
-		hint := fmt.Sprintf("Create with: gt polecat add %s/%s", rigName, polecatName)
+		hint := fmt.Sprintf("Create with: gt polecat identity add %s %s", rigName, polecatName)
 		return fmt.Errorf("%s", suggest.FormatSuggestion("Polecat", polecatName, suggestions, hint))
 	}
 
@@ -516,6 +521,17 @@ func runSessionRestart(cmd *cobra.Command, args []string) error {
 		if err := polecatMgr.Stop(polecatName, sessionForce); err != nil {
 			return fmt.Errorf("stopping session: %w", err)
 		}
+
+		// Wait for session to fully terminate before starting a new one.
+		// Without this, Start may fail or create a duplicate if the old
+		// session hasn't been cleaned up by tmux yet.
+		for i := 0; i < 10; i++ {
+			still, _ := polecatMgr.IsRunning(polecatName)
+			if !still {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
 	// Start fresh session
@@ -542,13 +558,17 @@ func runSessionStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Get session info
 	info, err := polecatMgr.Status(polecatName)
 	if err != nil {
 		return fmt.Errorf("getting status: %w", err)
 	}
 
-	// Format output
+	if sessionStatusJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(info)
+	}
+
 	fmt.Printf("%s Session: %s/%s\n\n", style.Bold.Render("📺"), rigName, polecatName)
 
 	if info.Running {
@@ -653,7 +673,7 @@ func runSessionCheck(cmd *cobra.Command, args []string) error {
 				continue
 			}
 			polecatName := entry.Name()
-			sessionName := fmt.Sprintf("gt-%s-%s", r.Name, polecatName)
+			sessionName := session.PolecatSessionName(session.PrefixFor(r.Name), polecatName)
 			totalChecked++
 
 			// Check if session exists

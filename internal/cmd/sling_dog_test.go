@@ -1,6 +1,10 @@
 package cmd
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/steveyegge/gastown/internal/constants"
+)
 
 // TestIsDogTarget verifies the dog target pattern matching.
 // Dogs can be targeted via:
@@ -86,17 +90,24 @@ func TestDogDispatchInfoDelayedSession(t *testing.T) {
 func TestDogDispatchOptionsStruct(t *testing.T) {
 	opts := DogDispatchOptions{
 		Create:            true,
-		WorkDesc:          "mol-convoy-feed",
+		WorkDesc:          constants.MolConvoyFeed,
 		DelaySessionStart: true,
 	}
 
 	if !opts.Create {
 		t.Error("Create should be true")
 	}
-	if opts.WorkDesc != "mol-convoy-feed" {
-		t.Errorf("WorkDesc = %q, want %q", opts.WorkDesc, "mol-convoy-feed")
+	if opts.WorkDesc != constants.MolConvoyFeed {
+		t.Errorf("WorkDesc = %q, want %q", opts.WorkDesc, constants.MolConvoyFeed)
 	}
 	if !opts.DelaySessionStart {
 		t.Error("DelaySessionStart should be true")
+	}
+}
+
+// TestMaxDogPoolSize verifies the pool size constant matches the documented limit.
+func TestMaxDogPoolSize(t *testing.T) {
+	if maxDogPoolSize != 4 {
+		t.Errorf("maxDogPoolSize = %d, want 4 (matches mol-deacon-patrol pool sizing guideline)", maxDogPoolSize)
 	}
 }

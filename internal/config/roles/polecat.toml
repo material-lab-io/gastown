@@ -1,5 +1,5 @@
 # Polecat role definition
-# Ephemeral workers for batch work dispatch. Multiple per rig.
+# Persistent identity, ephemeral sessions. Batch work dispatch. Multiple per rig.
 
 role = "polecat"
 scope = "rig"
@@ -7,9 +7,9 @@ nudge = "Check your hook for work assignments."
 prompt_template = "polecat.md.tmpl"
 
 [session]
-pattern = "gt-{rig}-{name}"
+pattern = "{prefix}-{name}"
 work_dir = "{town}/{rig}/polecats/{name}"
-needs_pre_sync = true
+needs_pre_sync = false
 start_command = "exec claude --dangerously-skip-permissions"
 
 [env]

@@ -12,7 +12,9 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -26,6 +28,11 @@ import (
 const (
 	shutdownLockFile    = "daemon/shutdown.lock"
 	shutdownLockTimeout = 5 * time.Second
+
+	// defaultDownOrphanGraceSecs is the grace period for orphan cleanup during gt down.
+	// Short because gt down is meant to be quick - processes already had SIGTERM via
+	// KillSessionWithProcesses.
+	defaultDownOrphanGraceSecs = 5
 )
 
 var downCmd = &cobra.Command{
@@ -37,8 +44,8 @@ var downCmd = &cobra.Command{
 Shutdown levels (progressively more aggressive):
   gt down                    Stop infrastructure (default)
   gt down --polecats         Also stop all polecat sessions
-  gt down --all              Also stop bd daemons/activity
-  gt down --nuke             Also kill the tmux server (DESTRUCTIVE)
+  gt down --all              Full shutdown with orphan cleanup
+  gt down --nuke             Also kill the shared tmux server
 
 Infrastructure agents stopped:
   • Refineries - Per-rig work processors
@@ -47,6 +54,7 @@ Infrastructure agents stopped:
   • Boot       - Deacon's watchdog
   • Deacon     - Health orchestrator
   • Daemon     - Go background process
+  • Dolt       - Shared SQL database server
 
 This is a "pause" operation - use 'gt start' to bring everything back up.
 For permanent cleanup (removing worktrees), use 'gt shutdown' instead.
@@ -71,8 +79,8 @@ func init() {
 	downCmd.Flags().BoolVarP(&downQuiet, "quiet", "q", false, "Only show errors")
 	downCmd.Flags().BoolVarP(&downForce, "force", "f", false, "Force kill without graceful shutdown")
 	downCmd.Flags().BoolVarP(&downPolecats, "polecats", "p", false, "Also stop all polecat sessions")
-	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Stop bd daemons/activity and verify shutdown")
-	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill entire tmux server (DESTRUCTIVE - kills non-GT sessions!)")
+	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Full shutdown with orphan cleanup and verification")
+	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill the shared tmux server (default socket) and all its sessions")
 	downCmd.Flags().BoolVar(&downDryRun, "dry-run", false, "Preview what would be stopped without taking action")
 	rootCmd.AddCommand(downCmd)
 }
@@ -144,7 +152,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 1: Stop refineries
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-refinery", rigName)
+		sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Refinery (%s)", rigName), true, "would stop")
@@ -164,7 +172,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 2: Stop witnesses
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-witness", rigName)
+		sessionName := session.WitnessSessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Witness (%s)", rigName), true, "would stop")
@@ -215,16 +223,75 @@ func runDown(cmd *cobra.Command, args []string) error {
 			if err := daemon.StopDaemon(townRoot); err != nil {
 				printDownStatus("Daemon", false, err.Error())
 				allOK = false
-			} else {
+			} else if pid > 0 {
 				printDownStatus("Daemon", true, fmt.Sprintf("stopped (was PID %d)", pid))
+			} else {
+				printDownStatus("Daemon", true, "stopped (stale lock cleaned)")
 			}
 		} else {
 			printDownStatus("Daemon", true, "not running")
 		}
 	}
 
-	// Phase 5: Verification (--all only)
-	if downAll && !downDryRun {
+	// Phase 4b: Stop Dolt server
+	doltCfg := doltserver.DefaultConfig(townRoot)
+	if _, statErr := os.Stat(doltCfg.DataDir); statErr == nil {
+		doltRunning, doltPid, doltErr := doltserver.IsRunning(townRoot)
+		if doltErr != nil {
+			printDownStatus("Dolt", false, fmt.Sprintf("status check failed: %v", doltErr))
+			allOK = false
+		} else if downDryRun {
+			if doltRunning {
+				printDownStatus("Dolt", true, fmt.Sprintf("would stop (PID %d)", doltPid))
+			}
+		} else {
+			if doltRunning {
+				if err := doltserver.Stop(townRoot); err != nil {
+					printDownStatus("Dolt", false, err.Error())
+					allOK = false
+				} else {
+					printDownStatus("Dolt", true, fmt.Sprintf("stopped (was PID %d)", doltPid))
+				}
+			} else {
+				printDownStatus("Dolt", true, "not running")
+			}
+		}
+	}
+
+	// Phase 4c: Clean up legacy "default" socket sessions.
+	// Old binaries created sessions on the "default" tmux socket. After
+	// transitioning to a per-town socket (e.g., "gt"), those ghost sessions
+	// persist and cause split-brain: the daemon sees them on "gt" but tools
+	// querying bare tmux see (or miss) them on "default".
+	if !downDryRun {
+		cleaned := cleanupLegacyDefaultSocket()
+		if cleaned > 0 {
+			printDownStatus("Legacy sessions", true, fmt.Sprintf("cleaned %d from 'default' socket", cleaned))
+		}
+	} else {
+		count := countLegacyDefaultSocketSessions()
+		if count > 0 {
+			printDownStatus("Legacy sessions", true, fmt.Sprintf("%d would be cleaned from 'default' socket", count))
+		}
+	}
+
+	// Phase 5: Orphan cleanup and verification (--all or --force)
+	if (downAll || downForce) && !downDryRun {
+		fmt.Println()
+
+		// Kill any processes tracked via PID files (defense-in-depth for
+		// processes that survived normal session teardown).
+		killed, pidErrs := session.KillTrackedPIDs(townRoot)
+		if killed > 0 {
+			fmt.Printf("  Killed %d tracked orphan process(es) via PID files\n", killed)
+		}
+		for _, e := range pidErrs {
+			fmt.Printf("  PID cleanup warning: %s\n", e)
+		}
+
+		fmt.Println("Cleaning up orphaned Claude processes...")
+		cleanupOrphanedClaude(defaultDownOrphanGraceSecs)
+
 		time.Sleep(500 * time.Millisecond)
 		respawned := verifyShutdown(t, townRoot)
 		if len(respawned) > 0 {
@@ -234,24 +301,31 @@ func runDown(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  • %s\n", r)
 			}
 			fmt.Println()
-			fmt.Printf("This may indicate systemd/launchd is managing bd.\n")
+			fmt.Printf("This may indicate a process manager is respawning agents.\n")
 			fmt.Printf("Check with:\n")
-			fmt.Printf("  %s\n", style.Dim.Render("systemctl status bd-daemon  # Linux"))
-			fmt.Printf("  %s\n", style.Dim.Render("launchctl list | grep bd    # macOS"))
+			fmt.Printf("  %s\n", style.Dim.Render("ps aux | grep claude  # Find respawned processes"))
+			fmt.Printf("  %s\n", style.Dim.Render("gt status             # Verify town state"))
 			allOK = false
 		}
 	}
 
-	// Phase 6: Nuke tmux server (--nuke only, DESTRUCTIVE)
+	// Phase 6: Nuke tmux server (--nuke only)
+	// Each town uses a per-town tmux socket derived from the town directory name
+	// (see registry.go InitRegistry), so --nuke only affects this town's server.
+	// Users may also have opened custom windows/panes, so we require confirmation.
 	if downNuke {
+		socket := tmux.GetDefaultSocket()
+		socketLabel := "default"
+		if socket != "" {
+			socketLabel = socket
+		}
 		if downDryRun {
-			printDownStatus("Tmux server", true, "would kill (DESTRUCTIVE)")
+			printDownStatus("Tmux server", true, fmt.Sprintf("would kill (socket: %s)", socketLabel))
 		} else if os.Getenv("GT_NUKE_ACKNOWLEDGED") == "" {
-			// Require explicit acknowledgement for destructive operation
 			fmt.Println()
-			fmt.Printf("%s The --nuke flag kills ALL tmux sessions, not just Gas Town.\n",
-				style.Bold.Render("⚠ BLOCKED:"))
-			fmt.Printf("This includes vim sessions, running builds, SSH connections, etc.\n")
+			fmt.Printf("%s The --nuke flag kills the shared tmux server (socket: %s).\n",
+				style.Bold.Render("⚠ BLOCKED:"), socketLabel)
+			fmt.Printf("All towns share this socket — this will destroy all tmux sessions, including any custom windows you opened.\n")
 			fmt.Println()
 			fmt.Printf("To proceed, run with: %s\n", style.Bold.Render("GT_NUKE_ACKNOWLEDGED=1 gt down --nuke"))
 			allOK = false
@@ -260,7 +334,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 				printDownStatus("Tmux server", false, err.Error())
 				allOK = false
 			} else {
-				printDownStatus("Tmux server", true, "killed (all tmux sessions destroyed)")
+				printDownStatus("Tmux server", true, fmt.Sprintf("killed (socket: %s)", socketLabel))
 			}
 		}
 	}
@@ -274,7 +348,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	if allOK {
 		fmt.Printf("%s All services stopped\n", style.Bold.Render("✓"))
-		stoppedServices := []string{"daemon", "deacon", "boot", "mayor"}
+		stoppedServices := []string{"dolt", "daemon", "deacon", "boot", "mayor"}
 		for _, rigName := range rigs {
 			stoppedServices = append(stoppedServices, fmt.Sprintf("%s/refinery", rigName))
 			stoppedServices = append(stoppedServices, fmt.Sprintf("%s/witness", rigName))
@@ -319,7 +393,7 @@ func stopAllPolecats(t *tmux.Tmux, townRoot string, rigNames []string, force boo
 		}
 
 		polecatMgr := polecat.NewSessionManager(t, r)
-		infos, err := polecatMgr.List()
+		infos, err := polecatMgr.ListPolecats()
 		if err != nil {
 			continue
 		}
@@ -368,7 +442,9 @@ func stopSession(t *tmux.Tmux, sessionName string) (bool, error) {
 	// Try graceful shutdown first (Ctrl-C, best-effort interrupt)
 	if !downForce {
 		_ = t.SendKeysRaw(sessionName, "C-c")
-		time.Sleep(100 * time.Millisecond)
+		if session.WaitForSessionExit(t, sessionName, constants.GracefulShutdownTimeout) {
+			return true, nil // Process exited gracefully
+		}
 	}
 
 	// Kill the session (with explicit process termination to prevent orphans)
@@ -409,7 +485,7 @@ func verifyShutdown(t *tmux.Tmux, townRoot string) []string {
 	sessions, err := t.ListSessions()
 	if err == nil {
 		for _, sess := range sessions {
-			if strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-") {
+			if session.IsKnownSession(sess) {
 				respawned = append(respawned, fmt.Sprintf("tmux session %s", sess))
 			}
 		}
@@ -486,5 +562,53 @@ func findOrphanedClaudeProcesses(townRoot string) []int {
 	}
 
 	return orphaned
+}
+
+// cleanupLegacyDefaultSocket removes Gas Town sessions left on the "default"
+// tmux socket by old binaries. Returns the number of sessions cleaned.
+func cleanupLegacyDefaultSocket() int {
+	currentSocket := tmux.GetDefaultSocket()
+	if currentSocket == "" || currentSocket == "default" {
+		return 0 // Already on the default socket, nothing to clean up
+	}
+
+	legacyTmux := tmux.NewTmuxWithSocket("default")
+	sessions, err := legacyTmux.ListSessions()
+	if err != nil {
+		return 0 // No server on default socket
+	}
+
+	var cleaned int
+	for _, sess := range sessions {
+		if session.IsKnownSession(sess) {
+			if err := legacyTmux.KillSessionWithProcesses(sess); err == nil {
+				cleaned++
+			}
+		}
+	}
+	return cleaned
+}
+
+// countLegacyDefaultSocketSessions counts Gas Town sessions on the "default"
+// tmux socket (for dry-run output).
+func countLegacyDefaultSocketSessions() int {
+	currentSocket := tmux.GetDefaultSocket()
+	if currentSocket == "" || currentSocket == "default" {
+		return 0
+	}
+
+	legacyTmux := tmux.NewTmuxWithSocket("default")
+	sessions, err := legacyTmux.ListSessions()
+	if err != nil {
+		return 0
+	}
+
+	var count int
+	for _, sess := range sessions {
+		if session.IsKnownSession(sess) {
+			count++
+		}
+	}
+	return count
 }
 

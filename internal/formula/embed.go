@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 )
 
-// Generate formulas directory from canonical source at .beads/formulas/
-//go:generate sh -c "rm -rf formulas && mkdir -p formulas && cp ../../.beads/formulas/*.formula.toml formulas/"
+// Formulas live in internal/formula/formulas/ (source of truth).
+// They are embedded into the binary and provisioned to .beads/formulas/ at install time.
 
 //go:embed formulas/*.formula.toml
 var formulasFS embed.FS
@@ -41,6 +41,29 @@ type HealthReport struct {
 	Missing   int // file was deleted
 	New       int // new formula not yet installed
 	Untracked int // file exists but not in .installed.json (safe to update)
+	Error     int // file could not be read (e.g. permission denied)
+}
+
+// GetEmbeddedFormulaContent returns the raw content of an embedded formula by name.
+// The name can be with or without the .formula.toml suffix.
+// Returns the content bytes, or an error if the formula is not found.
+func GetEmbeddedFormulaContent(name string) ([]byte, error) {
+	// Normalize: ensure the filename has the correct suffix
+	filename := name
+	if !hasFormulaSuffix(filename) {
+		filename = filename + ".formula.toml"
+	}
+	content, err := formulasFS.ReadFile("formulas/" + filename)
+	if err != nil {
+		return nil, fmt.Errorf("embedded formula %q not found: %w", name, err)
+	}
+	return content, nil
+}
+
+// hasFormulaSuffix checks if a name already has a formula file suffix.
+func hasFormulaSuffix(name string) bool {
+	return len(name) > len(".formula.toml") &&
+		name[len(name)-len(".formula.toml"):] == ".formula.toml"
 }
 
 // computeHash computes SHA256 hash of data.
@@ -148,8 +171,7 @@ func ProvisionFormulas(beadsPath string) (int, error) {
 		if _, err := os.Stat(destPath); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
-			// Log unexpected errors but continue
-			continue
+			return count, fmt.Errorf("checking %s: %w", entry.Name(), err)
 		}
 
 		content, err := formulasFS.ReadFile("formulas/" + entry.Name())
@@ -216,8 +238,9 @@ func CheckFormulaHealth(beadsPath string) (*HealthReport, error) {
 				report.New++
 			}
 		} else if err != nil {
-			// Some other error reading file
+			// Some other error reading file (e.g. permission denied)
 			status.Status = "error"
+			report.Error++
 		} else {
 			status.CurrentHash = currentHash
 

@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -68,13 +68,16 @@ const (
 	TypeMerged       = "merged"
 	TypeMergeFailed  = "merge_failed"
 	TypeMergeSkipped = "merge_skipped"
+
+	// Scheduler events
+	TypeSchedulerEnqueue        = "scheduler_enqueue"         // Bead scheduled for deferred dispatch
+	TypeSchedulerDispatch       = "scheduler_dispatch"        // Bead dispatched from scheduler
+	TypeSchedulerDispatchFailed = "scheduler_dispatch_failed" // Bead dispatch failed (requeued)
+	TypeSchedulerCloseRetry     = "scheduler_close_retry"     // Context close needed last-resort attempt
 )
 
 // EventsFile is the name of the raw events log.
 const EventsFile = ".events.jsonl"
-
-// mutex protects concurrent writes to the events file.
-var mutex sync.Mutex
 
 // Log writes an event to the events log.
 // The event is appended to ~/gt/.events.jsonl.
@@ -102,6 +105,8 @@ func LogAudit(eventType, actor string, payload map[string]interface{}) error {
 }
 
 // write appends an event to the events file.
+// Uses flock for cross-process synchronization — sync.Mutex only protects
+// intra-process goroutines, but multiple gt processes write concurrently.
 func write(event Event) error {
 	// Find town root
 	townRoot, err := workspace.FindFromCwd()
@@ -119,18 +124,25 @@ func write(event Event) error {
 	}
 	data = append(data, '\n')
 
-	// Append to file with proper locking
-	mutex.Lock()
-	defer mutex.Unlock()
+	// Acquire cross-process file lock
+	fl := flock.New(eventsPath + ".lock")
+	if err := fl.Lock(); err != nil {
+		return fmt.Errorf("acquiring events file lock: %w", err)
+	}
+	defer fl.Unlock() //nolint:errcheck // best-effort unlock
 
 	f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) //nolint:gosec // G302: events file is non-sensitive operational data
 	if err != nil {
 		return fmt.Errorf("opening events file: %w", err)
 	}
-	defer f.Close()
 
 	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("writing event: %w", err)
+	}
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing events file: %w", err)
 	}
 
 	return nil
@@ -329,4 +341,30 @@ func SessionPayload(sessionID, role, topic, cwd string) map[string]interface{} {
 		p["cwd"] = cwd
 	}
 	return p
+}
+
+// SchedulerEnqueuePayload creates a payload for scheduler enqueue events.
+func SchedulerEnqueuePayload(beadID, rig string) map[string]interface{} {
+	return map[string]interface{}{
+		"bead": beadID,
+		"rig":  rig,
+	}
+}
+
+// SchedulerDispatchPayload creates a payload for scheduler dispatch events.
+func SchedulerDispatchPayload(beadID, rig, polecat string) map[string]interface{} {
+	return map[string]interface{}{
+		"bead":    beadID,
+		"rig":     rig,
+		"polecat": polecat,
+	}
+}
+
+// SchedulerDispatchFailedPayload creates a payload for scheduler dispatch failure events.
+func SchedulerDispatchFailedPayload(beadID, rig, errMsg string) map[string]interface{} {
+	return map[string]interface{}{
+		"bead":  beadID,
+		"rig":   rig,
+		"error": errMsg,
+	}
 }

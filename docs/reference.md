@@ -2,43 +2,7 @@
 
 Technical reference for Gas Town internals. Read the README first.
 
-## Directory Structure
-
-```
-~/gt/                           Town root
-├── .beads/                     Town-level beads (hq-* prefix)
-├── mayor/                      Mayor agent home (town coordinator)
-│   ├── town.json               Town configuration
-│   ├── CLAUDE.md               Mayor context (on disk)
-│   └── .claude/settings.json   Mayor Claude settings
-├── deacon/                     Deacon agent home (background supervisor)
-│   └── .claude/settings.json   Deacon settings (context via gt prime)
-└── <rig>/                      Project container (NOT a git clone)
-    ├── config.json             Rig identity
-    ├── .beads/ → mayor/rig/.beads
-    ├── .repo.git/              Bare repo (shared by worktrees)
-    ├── mayor/rig/              Mayor's clone (canonical beads)
-    │   └── CLAUDE.md           Per-rig mayor context (on disk)
-    ├── witness/                Witness agent home (monitors only)
-    │   └── .claude/settings.json  (context via gt prime)
-    ├── refinery/               Refinery settings parent
-    │   ├── .claude/settings.json
-    │   └── rig/                Worktree on main
-    │       └── CLAUDE.md       Refinery context (on disk)
-    ├── crew/                   Crew settings parent (shared)
-    │   ├── .claude/settings.json  (context via gt prime)
-    │   └── <name>/rig/         Human workspaces
-    └── polecats/               Polecat settings parent (shared)
-        ├── .claude/settings.json  (context via gt prime)
-        └── <name>/rig/         Worker worktrees
-```
-
-**Key points:**
-
-- Rig root is a container, not a clone
-- `.repo.git/` is bare - refinery and polecats are worktrees
-- Per-rig `mayor/rig/` holds canonical `.beads/`, others inherit via redirect
-- Settings placed in parent dirs (not git clones) for upward traversal
+> For directory structure details, see [architecture.md](design/architecture.md).
 
 ## Beads Routing
 
@@ -71,19 +35,65 @@ Debug routing: `BD_DEBUG_ROUTING=1 bd show <id>`
   "type": "rig",
   "name": "myproject",
   "git_url": "https://github.com/...",
+  "default_branch": "main",
   "beads": { "prefix": "mp" }
 }
 ```
+
+**Rig config fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `default_branch` | `string` | `"main"` | Default branch for the rig. Auto-detected from remote during `gt rig add`. Used as the merge target by the Refinery and as the base for polecats when no integration branch is active. |
 
 ### Settings (`settings/config.json`)
 
 ```json
 {
   "theme": "desert",
-  "max_workers": 5,
-  "merge_queue": { "enabled": true }
+  "merge_queue": {
+    "enabled": true,
+    "run_tests": true,
+    "setup_command": "",
+    "typecheck_command": "",
+    "lint_command": "",
+    "test_command": "go test ./...",
+    "build_command": "",
+    "on_conflict": "assign_back",
+    "delete_merged_branches": true,
+    "retry_flaky_tests": 1,
+    "poll_interval": "30s",
+    "max_concurrent": 1,
+    "integration_branch_polecat_enabled": true,
+    "integration_branch_refinery_enabled": true,
+    "integration_branch_template": "integration/{title}",
+    "integration_branch_auto_land": false
+  }
 }
 ```
+
+**Merge queue fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `true` | Whether the merge queue is active |
+| `run_tests` | `bool` | `true` | Run tests before merging |
+| `setup_command` | `string` | `""` | Setup/install command (e.g., `pnpm install`) |
+| `typecheck_command` | `string` | `""` | Type check command (e.g., `tsc --noEmit`) |
+| `lint_command` | `string` | `""` | Lint command (e.g., `eslint .`) |
+| `test_command` | `string` | `"go test ./..."` | Test command to run |
+| `build_command` | `string` | `""` | Build command (e.g., `go build ./...`) |
+| `on_conflict` | `string` | `"assign_back"` | Conflict strategy: `assign_back` or `auto_rebase` |
+| `delete_merged_branches` | `bool` | `true` | Delete source branches after merging |
+| `retry_flaky_tests` | `int` | `1` | Number of times to retry flaky tests |
+| `poll_interval` | `string` | `"30s"` | How often Refinery polls for new MRs |
+| `max_concurrent` | `int` | `1` | Maximum concurrent merges |
+| `integration_branch_polecat_enabled` | `*bool` | `true` | Polecats auto-source worktrees from integration branches |
+| `integration_branch_refinery_enabled` | `*bool` | `true` | `gt done` / `gt mq submit` auto-target integration branches |
+| `integration_branch_template` | `string` | `"integration/{title}"` | Branch name template (`{title}`, `{epic}`, `{prefix}`, `{user}`) |
+| `integration_branch_auto_land` | `*bool` | `false` | Refinery patrol auto-lands when all children closed |
+
+See [Integration Branches](concepts/integration-branches.md) for integration branch details.
 
 ### Runtime (`.runtime/` - gitignored)
 
@@ -175,75 +185,26 @@ with = "macro-formula"
 
 ## Molecule Lifecycle
 
-```
-Formula (source TOML) ─── "Ice-9"
-    │
-    ▼ bd cook
-Protomolecule (frozen template) ─── Solid
-    │
-    ├─▶ bd mol pour ──▶ Mol (persistent) ─── Liquid ──▶ bd squash ──▶ Digest
-    │
-    └─▶ bd mol wisp ──▶ Wisp (ephemeral) ─── Vapor ──┬▶ bd squash ──▶ Digest
-                                                  └▶ bd burn ──▶ (gone)
-```
+> For the full lifecycle diagram and detailed command reference, see [concepts/molecules.md](concepts/molecules.md).
 
-**Note**: Wisps are stored in `.beads/` with an ephemeral flag - they're not
-persisted to JSONL. They exist only in memory during execution.
+**Summary**: Formula (TOML) --`bd cook`--> Protomolecule --`bd mol pour`--> Mol (persistent) or Wisp (ephemeral) --`bd squash`--> Digest.
 
-## Molecule Commands
-
-**Principle**: `bd` = beads data operations, `gt` = agent operations.
-
-### Beads Operations (bd)
-
-```bash
-# Formulas
-bd formula list              # Available formulas
-bd formula show <name>       # Formula details
-bd cook <formula>            # Formula → Proto
-
-# Molecules (data operations)
-bd mol list                  # Available protos
-bd mol show <id>             # Proto details
-bd mol pour <proto>          # Create mol
-bd mol wisp <proto>          # Create wisp
-bd mol bond <proto> <parent> # Attach to existing mol
-bd mol squash <id>           # Condense to digest (explicit ID)
-bd mol burn <id>             # Discard wisp (explicit ID)
-```
-
-### Agent Operations (gt)
-
-```bash
-# Hook management (operates on current agent's hook)
-gt hook                    # What's on MY hook
-gt mol current               # What should I work on next
-gt mol progress <id>         # Execution progress of molecule
-gt mol attach <bead> <mol>   # Pin molecule to bead
-gt mol detach <bead>         # Unpin molecule from bead
-gt mol attach-from-mail <id> # Attach from mail message
-
-# Agent lifecycle (operates on agent's attached molecule)
-gt mol burn                  # Burn attached molecule (no ID needed)
-gt mol squash                # Squash attached molecule (no ID needed)
-gt mol step done <step>      # Complete a molecule step
-```
-
-**Key distinction**: `bd mol burn/squash <id>` take explicit molecule IDs.
-`gt mol burn/squash` operate on the current agent's attached molecule
-(auto-detected from working directory).
+| Operation | bd (data) | gt (agent) |
+|-----------|-----------|------------|
+| Cook/pour/wisp | `bd cook`, `bd mol pour/wisp` | — |
+| Squash/burn | `bd mol squash/burn <id>` | `gt mol squash/burn` (attached) |
+| Navigate | `bd mol current`, `bd mol show` | `gt hook`, `gt mol current` |
+| Attach | — | `gt mol attach/detach` |
 
 ## Agent Lifecycle
 
 ### Polecat Shutdown
 
 ```
-1. Complete work steps
-2. bd mol squash (create digest)
-3. Submit to merge queue
-4. gt handoff (request shutdown)
-5. Wait for Witness to kill session
-6. Witness removes worktree + branch
+1. Work through formula checklist (shown inline by gt prime)
+2. Submit to merge queue via gt done
+3. gt done nukes sandbox and exits
+4. Witness removes worktree + branch
 ```
 
 ### Session Cycling
@@ -279,7 +240,6 @@ These are set in tmux session environment when agents are spawned.
 | `GT_POLECAT` | Polecat worker name | polecat only |
 | `GT_CREW` | Crew worker name | crew only |
 | `BEADS_AGENT_NAME` | Agent name for beads operations | polecat, crew |
-| `BEADS_NO_DAEMON` | Disable beads daemon (isolated context) | polecat, crew |
 
 ### Other Variables
 
@@ -295,7 +255,7 @@ These are set in tmux session environment when agents are spawned.
 |------|---------------|
 | **Mayor** | `GT_ROLE=mayor`, `BD_ACTOR=mayor` |
 | **Deacon** | `GT_ROLE=deacon`, `BD_ACTOR=deacon` |
-| **Boot** | `GT_ROLE=boot`, `BD_ACTOR=deacon-boot` |
+| **Boot** | `GT_ROLE=deacon/boot`, `BD_ACTOR=deacon-boot` |
 | **Witness** | `GT_ROLE=witness`, `GT_RIG=<rig>`, `BD_ACTOR=<rig>/witness` |
 | **Refinery** | `GT_ROLE=refinery`, `GT_RIG=<rig>`, `BD_ACTOR=<rig>/refinery` |
 | **Polecat** | `GT_ROLE=polecat`, `GT_RIG=<rig>`, `GT_POLECAT=<name>`, `BD_ACTOR=<rig>/polecats/<name>` |
@@ -327,88 +287,77 @@ Understanding this hierarchy is essential for proper configuration.
 | **Witness** | `~/gt/<rig>/witness/` | No git clone, monitors polecats only |
 | **Refinery** | `~/gt/<rig>/refinery/rig/` | Worktree on main branch |
 | **Crew** | `~/gt/<rig>/crew/<name>/rig/` | Persistent human workspace clone |
-| **Polecat** | `~/gt/<rig>/polecats/<name>/rig/` | Ephemeral worker worktree |
+| **Polecat** | `~/gt/<rig>/polecats/<name>/rig/` | Polecat worktree (ephemeral sandbox) |
 
 Note: The per-rig `<rig>/mayor/rig/` directory is NOT a working directory—it's
 a git clone that holds the canonical `.beads/` database for that rig.
 
 ### Settings File Locations
 
-Claude Code searches for `.claude/settings.json` starting from the working
-directory and traversing upward. Settings are placed in **parent directories**
-(not inside git clones) so they're found via directory traversal without
-polluting source repositories:
+Settings are installed in gastown-managed parent directories and passed to
+Claude Code via the `--settings` flag. This keeps customer repos clean:
 
 ```
 ~/gt/
-├── mayor/.claude/settings.json          # Mayor settings
-├── deacon/.claude/settings.json         # Deacon settings
+├── mayor/.claude/settings.json              # Mayor settings (cwd = settings dir)
+├── deacon/.claude/settings.json             # Deacon settings (cwd = settings dir)
 └── <rig>/
-    ├── witness/.claude/settings.json    # Witness settings (no rig/ subdir)
-    ├── refinery/.claude/settings.json   # Found by refinery/rig/ via traversal
-    ├── crew/.claude/settings.json       # Shared by all crew/<name>/rig/
-    └── polecats/.claude/settings.json   # Shared by all polecats/<name>/rig/
+    ├── crew/.claude/settings.json           # Shared by all crew members
+    ├── polecats/.claude/settings.json       # Shared by all polecats
+    ├── witness/.claude/settings.json        # Witness settings
+    └── refinery/.claude/settings.json       # Refinery settings
 ```
 
-**Why parent directories?** Agents working in git clones (like `refinery/rig/`)
-would pollute the source repo if settings were placed there. By putting settings
-one level up, Claude finds them via upward traversal, and all workers of the
-same type share the same settings.
+The `--settings` flag loads these as a separate priority tier that merges
+additively with any project-level settings in the customer repo.
 
-### CLAUDE.md Locations
+### CLAUDE.md
 
-Role context is delivered via CLAUDE.md files or ephemeral injection:
+Only `~/gt/CLAUDE.md` exists on disk — a minimal identity anchor that prevents
+agents from losing their Gas Town identity after context compaction or new sessions.
 
-| Role | CLAUDE.md Location | Method |
-|------|-------------------|--------|
-| **Mayor** | `~/gt/mayor/CLAUDE.md` | On disk |
-| **Deacon** | (none) | Injected via `gt prime` at SessionStart |
-| **Witness** | (none) | Injected via `gt prime` at SessionStart |
-| **Refinery** | `<rig>/refinery/rig/CLAUDE.md` | On disk (inside worktree) |
-| **Crew** | (none) | Injected via `gt prime` at SessionStart |
-| **Polecat** | (none) | Injected via `gt prime` at SessionStart |
+Full role context (~300-500 lines per role) is injected ephemerally by `gt prime`
+via the SessionStart hook. No per-directory CLAUDE.md or AGENTS.md files are created.
 
-Additionally, each rig has `<rig>/mayor/rig/CLAUDE.md` for the per-rig mayor clone
-(used for beads operations, not a running agent).
+**Why no per-directory files?**
+- Claude Code traverses upward from CWD for CLAUDE.md — all agents under `~/gt/` find the town-root file
+- AGENTS.md (for Codex) uses downward traversal from git root — parent directories are invisible, so per-directory AGENTS.md never worked
+- The real context comes from `gt prime`, making on-disk bootstrap pointers redundant
 
-**Why ephemeral injection?** Writing CLAUDE.md into git clones would:
-1. Pollute source repos when agents commit/push
-2. Leak Gas Town internals into project history
-3. Conflict with project-specific CLAUDE.md files
+### Customer Repo Files (CLAUDE.md and .claude/)
 
-The `gt prime` command runs at SessionStart hook and injects context without
-persisting it to disk.
+Gas Town no longer uses git sparse checkout to hide customer repo files. Customer
+repositories can have their own `.claude/` directory and `CLAUDE.md` — these are
+preserved in all worktrees (crew, polecats, refinery, mayor/rig).
 
-### Sparse Checkout (Source Repo Isolation)
+Gas Town's context comes from the town-root `CLAUDE.md` identity anchor
+(picked up by all agents via Claude Code's upward directory traversal),
+`gt prime` via the SessionStart hook, and the customer repo's own `CLAUDE.md`.
+These coexist safely because:
 
-When agents work on source repositories that have their own Claude Code configuration,
-Gas Town uses git sparse checkout to exclude Claude Code context files:
+- **`--settings` flag provides Gas Town settings** as a separate tier that merges
+  additively with customer project settings, so both coexist cleanly
+- **`gt prime` injects role context** ephemerally via SessionStart hook, which is
+  additive with the customer's `CLAUDE.md` — both are loaded
+- Gas Town settings live in parent directories (not in customer repos), so
+  customer `.claude/` files are fully preserved
 
-```bash
-# Automatically configured for worktrees - excludes:
-# - .claude/       : settings, rules, agents, commands
-# - CLAUDE.md      : primary context file
-# - CLAUDE.local.md: personal context file
-# Note: .mcp.json is NOT excluded so worktrees inherit MCP server config
-git sparse-checkout set --no-cone '/*' '!/.claude/' '!/CLAUDE.md' '!/CLAUDE.local.md'
-```
-
-This ensures agents use Gas Town's context, not the source repo's instructions.
-MCP servers defined in `.mcp.json` are inherited by all worktrees for tool access.
-
-**Doctor check**: `gt doctor` verifies sparse checkout is configured correctly.
-Run `gt doctor --fix` to update legacy configurations missing the newer patterns.
+**Doctor check**: `gt doctor` warns if legacy sparse checkout is still configured.
+Run `gt doctor --fix` to remove it. Tracked `settings.json` files in worktrees are
+recognized as customer project config and are not flagged as stale.
 
 ### Settings Inheritance
 
-Claude Code's settings search order (first match wins):
+Claude Code's settings are layered from multiple sources:
 
-1. `.claude/settings.json` in current working directory
+1. `.claude/settings.json` in current working directory (customer project)
 2. `.claude/settings.json` in parent directories (traversing up)
 3. `~/.claude/settings.json` (user global settings)
+4. `--settings <path>` flag (loaded as a separate additive tier)
 
-Gas Town places settings at each agent's working directory root, so agents
-find their role-specific settings before reaching any parent or global config.
+Gas Town uses the `--settings` flag to inject role-specific settings from
+gastown-managed parent directories. This merges additively with customer
+project settings rather than overriding them.
 
 ### Settings Templates
 
@@ -426,9 +375,9 @@ at session start. Interactive agents wait for user prompts.
 
 | Problem | Solution |
 |---------|----------|
-| Agent using wrong settings | Check `gt doctor`, verify sparse checkout |
-| Settings not found | Ensure `.claude/settings.json` exists at role home |
-| Source repo settings leaking | Run `gt doctor --fix` to configure sparse checkout |
+| Agent using wrong settings | Check `gt doctor`, verify `.claude/settings.json` in role parent dir |
+| Settings not found | Run `gt install` to recreate settings, or `gt doctor --fix` |
+| Source repo settings leaking | Run `gt doctor --fix` to remove legacy sparse checkout |
 | Mayor settings affecting polecats | Mayor should run in `mayor/`, not town root |
 
 ## CLI Reference
@@ -616,6 +565,22 @@ gt mq retry <id>             # Retry a failed merge request
 gt mq reject <id>            # Reject a merge request
 ```
 
+#### Integration Branch Commands
+
+```bash
+gt mq integration create <epic-id>              # Create integration branch
+gt mq integration create <epic-id> --branch "feat/{title}"  # Custom template
+gt mq integration create <epic-id> --base-branch develop   # Non-main base
+gt mq integration status <epic-id>              # Show branch status
+gt mq integration status <epic-id> --json       # JSON output
+gt mq integration land <epic-id>                # Merge to base branch (default: main)
+gt mq integration land <epic-id> --dry-run      # Preview only
+gt mq integration land <epic-id> --force        # Land with open MRs
+gt mq integration land <epic-id> --skip-tests   # Skip test run
+```
+
+See [Integration Branches](concepts/integration-branches.md) for the full workflow.
+
 ## Beads Commands (bd)
 
 ```bash
@@ -637,13 +602,13 @@ Deacon, Witness, and Refinery run continuous patrol loops using wisps:
 |-------|-----------------|----------------|
 | **Deacon** | `mol-deacon-patrol` | Agent lifecycle, plugin execution, health checks |
 | **Witness** | `mol-witness-patrol` | Monitor polecats, nudge stuck workers |
-| **Refinery** | `mol-refinery-patrol` | Process merge queue, review MRs |
+| **Refinery** | `mol-refinery-patrol` | Process merge queue, review MRs, check integration branches |
 
 ```
-1. bd mol wisp mol-<role>-patrol
-2. Execute steps (check workers, process queue, run plugins)
-3. bd mol squash (or burn if routine)
-4. Loop
+1. gt patrol new               # Create root-only wisp
+2. gt prime                    # Shows patrol checklist inline
+3. Work through each step
+4. gt patrol report --summary "..."  # Close + start next cycle
 ```
 
 ## Plugin Molecules
@@ -663,22 +628,55 @@ Patrol molecules bond plugins dynamically:
 bd mol bond mol-security-scan $PATROL_ID --var scope="$SCOPE"
 ```
 
+## Formula Invocation Patterns
+
+**CRITICAL**: Different formula types require different invocation methods.
+
+### Workflow Formulas (sequential steps, single polecat)
+
+Examples: `shiny`, `shiny-enterprise`, `mol-polecat-work`
+
+```bash
+gt sling <formula> --on <bead-id> <target>
+gt sling shiny-enterprise --on gt-abc123 gastown
+```
+
+### Convoy Formulas (parallel legs, multiple polecats)
+
+Examples: `code-review`
+
+**DO NOT use `gt sling` for convoy formulas!** It fails with "convoy type not supported".
+
+```bash
+# Correct invocation - use gt formula run:
+gt formula run code-review --pr=123
+gt formula run code-review --files="src/*.go"
+
+# Dry run to preview:
+gt formula run code-review --pr=123 --dry-run
+```
+
+### Identifying Formula Type
+
+```bash
+gt formula show <name>   # Shows "Type: convoy" or "Type: workflow"
+bd formula list          # Lists formulas by type
+```
+
+### Why This Matters
+
+- `gt sling` attempts to cook+pour the formula, which fails for convoy type
+- `gt formula run` handles convoy dispatch directly, spawning parallel polecats
+- Convoy formulas create multiple polecats (one per leg) + synthesis step
+
 ## Common Issues
 
 | Problem | Solution |
 |---------|----------|
 | Agent in wrong directory | Check cwd, `gt doctor` |
 | Beads prefix mismatch | Check `bd show` vs rig config |
-| Worktree conflicts | Ensure `BEADS_NO_DAEMON=1` for polecats |
+| Worktree conflicts | Check worktree state, `gt doctor` |
 | Stuck worker | `gt nudge`, then `gt peek` |
 | Dirty git state | Commit or discard, then `gt handoff` |
 
-## Architecture Notes
-
-**Bare repo pattern**: `.repo.git/` is bare (no working dir). Refinery and polecats are worktrees sharing refs. Polecat branches visible to refinery immediately.
-
-**Beads as control plane**: No separate orchestrator. Molecule steps ARE beads issues. State transitions are git commits.
-
-**Nondeterministic idempotence**: Any worker can continue any molecule. Steps are atomic checkpoints in beads.
-
-**Convoy tracking**: Convoys track batched work across rigs. A "swarm" is ephemeral - just the workers currently on a convoy's issues. See [Convoys](concepts/convoy.md) for details.
+> For architecture details (bare repo pattern, beads as control plane, nondeterministic idempotence), see [architecture.md](design/architecture.md).

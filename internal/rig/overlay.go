@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/style"
 )
 
 // CopyOverlay copies files from <rigPath>/.runtime/overlay/ to the destination path.
@@ -48,7 +50,7 @@ func CopyOverlay(rigPath, destPath string) error {
 
 		if err := copyFilePreserveMode(srcPath, dstPath); err != nil {
 			// Log warning but continue - don't fail spawn for overlay issues
-			fmt.Printf("Warning: could not copy overlay file %s: %v\n", entry.Name(), err)
+			style.PrintWarning("could not copy overlay file %s: %v", entry.Name(), err)
 			continue
 		}
 	}
@@ -61,12 +63,23 @@ func CopyOverlay(rigPath, destPath string) error {
 func EnsureGitignorePatterns(worktreePath string) error {
 	gitignorePath := filepath.Join(worktreePath, ".gitignore")
 
-	// Required patterns for Gas Town worktrees
+	// Required patterns for Gas Town worktrees.
+	// DO NOT add ".beads/" here. Beads manages its own .beads/.gitignore
+	// (created by bd init) which selectively ignores runtime files.
+	// Adding .beads/ here overrides that and breaks bd sync.
+	// This has regressed twice (PR #753 added it, #891 removed it,
+	// #966 re-added it). See overlay_test.go for a regression guard.
+	//
+	// .claude/ is the broad pattern (covers commands/, settings.json, rules/, etc.).
+	// Settings are installed in gastown-managed parent directories via --settings flag,
+	// but Cursor still creates .claude/ inside worktrees at runtime. The narrow
+	// .claude/commands/ pattern missed other Cursor-created files, causing gt done
+	// to fail with "uncommitted changes would be lost" on untracked .claude/ entries.
 	requiredPatterns := []string{
 		".runtime/",
 		".claude/",
 		".logs/",
-		".beads/",
+		"__pycache__/",
 	}
 
 	// Read existing gitignore content
@@ -78,12 +91,10 @@ func EnsureGitignorePatterns(worktreePath string) error {
 	// Find missing patterns
 	var missing []string
 	for _, pattern := range requiredPatterns {
-		// Check various forms: .runtime, .runtime/, /.runtime, etc.
 		found := false
 		for _, line := range strings.Split(existingContent, "\n") {
 			line = strings.TrimSpace(line)
-			if line == pattern || line == strings.TrimSuffix(pattern, "/") ||
-				line == "/"+pattern || line == "/"+strings.TrimSuffix(pattern, "/") {
+			if matchesGitignorePattern(line, pattern) {
 				found = true
 				break
 			}
@@ -125,6 +136,35 @@ func EnsureGitignorePatterns(worktreePath string) error {
 	return nil
 }
 
+// matchesGitignorePattern checks if a gitignore line covers the required pattern.
+// Handles variant forms (with/without trailing slash, leading slash) and recognizes
+// that a broader directory pattern (e.g., ".claude/") covers more specific paths
+// (e.g., ".claude/commands/").
+func matchesGitignorePattern(line, pattern string) bool {
+	// Strip leading slash for comparison
+	normLine := strings.TrimPrefix(line, "/")
+	normPattern := strings.TrimPrefix(pattern, "/")
+
+	// Exact match or trailing-slash variants
+	if normLine == normPattern ||
+		normLine == strings.TrimSuffix(normPattern, "/") ||
+		normLine+"/" == normPattern {
+		return true
+	}
+
+	// A broader directory pattern covers more specific paths underneath it.
+	// e.g., ".claude/" covers ".claude/commands/"
+	if strings.HasSuffix(normLine, "/") && strings.HasPrefix(normPattern, normLine) {
+		return true
+	}
+	// Also handle directory pattern without trailing slash
+	if !strings.Contains(normLine, "/") && strings.HasPrefix(normPattern, normLine+"/") {
+		return true
+	}
+
+	return false
+}
+
 // copyFilePreserveMode copies a file from src to dst, preserving the source file's permissions.
 func copyFilePreserveMode(src, dst string) error {
 	// Get source file info for permissions
@@ -145,11 +185,17 @@ func copyFilePreserveMode(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create destination: %w", err)
 	}
-	defer dstFile.Close()
 
 	// Copy contents
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		dstFile.Close()
 		return fmt.Errorf("copy contents: %w", err)
+	}
+
+	// Explicitly check Close() — on many filesystems, buffered data is flushed
+	// at Close() time, so a full-disk error surfaces here, not during Write.
+	if err := dstFile.Close(); err != nil {
+		return fmt.Errorf("closing destination: %w", err)
 	}
 
 	return nil

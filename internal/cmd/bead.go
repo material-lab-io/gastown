@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -16,7 +17,16 @@ var beadCmd = &cobra.Command{
 	Aliases: []string{"bd"},
 	GroupID: GroupWork,
 	Short:   "Bead management utilities",
-	Long:    `Utilities for managing beads across repositories.`,
+	Long: `Utilities for managing beads across repositories.
+
+Provides operations that span multiple beads repositories, such as
+moving beads between repos and viewing beads by ID with automatic
+prefix-based routing.
+
+Subcommands:
+  move    Move a bead from one repository to another
+  show    Show details of a bead (routes by prefix)
+  read    Alias for show`,
 }
 
 var beadMoveCmd = &cobra.Command{
@@ -105,9 +115,12 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 		targetPrefix = targetPrefix + "-"
 	}
 
-	// Get source bead details
-	showCmd := exec.Command("bd", "show", sourceID, "--json")
-	output, err := showCmd.Output()
+	// Get source bead details — resolve rig directory from prefix so that
+	// rig-prefixed beads are found in their rig database (GH#2126).
+	output, err := BdCmd("show", sourceID, "--json").
+		Dir(resolveBeadDir(sourceID)).
+		StripBeadsDir().
+		Output()
 	if err != nil {
 		return fmt.Errorf("getting bead %s: %w", sourceID, err)
 	}
@@ -131,6 +144,11 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Title: %s\n", source.Title)
 	fmt.Printf("  Type: %s\n", source.Type)
 
+	// Guard against flag-like titles propagating during move (gt-e0kx5)
+	if beads.IsFlagLikeTitle(source.Title) {
+		return fmt.Errorf("refusing to move bead: title %q looks like a CLI flag", source.Title)
+	}
+
 	if beadMoveDryRun {
 		fmt.Printf("\nDry run - would:\n")
 		fmt.Printf("  1. Create new bead with prefix %s\n", targetPrefix)
@@ -138,15 +156,18 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Build create command for target
-	createArgs := []string{
-		"create",
-		"--prefix", targetPrefix,
-		"--title", source.Title,
+	// Build create command for target.
+	// Skip --prefix for empty or bare "-" (normalization above turns "" into "-").
+	createArgs := []string{"create"}
+	if targetPrefix != "" && targetPrefix != "-" {
+		createArgs = append(createArgs, "--prefix", targetPrefix)
+	}
+	createArgs = append(createArgs,
+		"--title="+source.Title,
 		"--type", source.Type,
 		"--priority", fmt.Sprintf("%d", source.Priority),
 		"--silent", // Only output the ID
-	}
+	)
 
 	if source.Description != "" {
 		createArgs = append(createArgs, "--description", source.Description)
@@ -174,9 +195,15 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	closeCmd := exec.Command("bd", "close", sourceID, "--reason", closeReason)
 	closeCmd.Stderr = os.Stderr
 	if err := closeCmd.Run(); err != nil {
-		// Try to clean up the new bead if close fails
+		// Clean up the new bead since we couldn't close the source
 		fmt.Fprintf(os.Stderr, "Warning: failed to close source bead: %v\n", err)
-		fmt.Fprintf(os.Stderr, "New bead %s was created but source %s remains open\n", newID, sourceID)
+		cleanupCmd := exec.Command("bd", "close", newID, "--reason", "Cleanup: source bead close failed during move")
+		if cleanupErr := cleanupCmd.Run(); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: also failed to clean up new bead %s: %v\n", newID, cleanupErr)
+			fmt.Fprintf(os.Stderr, "Both %s and %s remain open - manual cleanup needed\n", sourceID, newID)
+		} else {
+			fmt.Fprintf(os.Stderr, "Cleaned up new bead %s\n", newID)
+		}
 		return err
 	}
 

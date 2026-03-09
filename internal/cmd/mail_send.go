@@ -3,6 +3,7 @@ package cmd
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -56,10 +57,12 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		if to == "" {
 			return fmt.Errorf("cannot determine identity (role: %s)", ctx.Role)
 		}
+	} else if mailTo != "" {
+		to = mailTo
 	} else if len(args) > 0 {
 		to = args[0]
 	} else {
-		return fmt.Errorf("address required (or use --self)")
+		return fmt.Errorf("address required (use positional arg, --to, or --self)")
 	}
 
 	// All mail uses town beads (two-level architecture)
@@ -71,13 +74,8 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Determine sender
 	from := detectSender()
 
-	// Create message
-	msg := &mail.Message{
-		From:    from,
-		To:      to,
-		Subject: mailSubject,
-		Body:    mailBody,
-	}
+	// Create message with auto-generated ID and thread ID
+	msg := mail.NewMessage(from, to, mailSubject, mailBody)
 
 	// Set priority (--urgent overrides --priority)
 	if mailUrgent {
@@ -101,6 +99,13 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Set CC recipients
 	msg.CC = mailCC
 
+	// Suppress router-side notification when --no-notify is passed.
+	// Otherwise the router handles idle-aware notification per-recipient,
+	// which also works correctly for fan-out (groups, lists, channels).
+	if mailNoNotify {
+		msg.SuppressNotify = true
+	}
+
 	// Handle reply-to: auto-set type to reply and look up thread
 	if mailReplyTo != "" {
 		msg.ReplyTo = mailReplyTo
@@ -108,11 +113,18 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			msg.Type = mail.TypeReply
 		}
 
-		// Look up original message to get thread ID
+		// Look up original message in current user's mailbox to get thread ID.
+		// The message we're replying to lives in our inbox (we received it),
+		// so we look it up via our own identity (from), not the recipient (to).
 		router := mail.NewRouter(workDir)
 		mailbox, err := router.GetMailbox(from)
-		if err == nil {
-			if original, err := mailbox.Get(mailReplyTo); err == nil {
+		if err != nil {
+			style.PrintWarning("could not open mailbox for thread lookup: %v", err)
+		} else {
+			original, err := mailbox.Get(mailReplyTo)
+			if err != nil {
+				style.PrintWarning("could not find original message %s for threading (new thread will be created)", mailReplyTo)
+			} else {
 				msg.ThreadID = original.ThreadID
 			}
 		}
@@ -130,8 +142,15 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 
 	recipients, err := resolver.Resolve(to)
 	if err != nil {
-		// Fall back to legacy routing if resolver fails
+		// Validation errors are definitive — do not fall back to legacy routing,
+		// which would silently deliver to a dead inbox.
+		// See: https://github.com/steveyegge/gastown/issues/2038
+		if errors.Is(err, mail.ErrUnknownRecipient) {
+			return err
+		}
+		// Fall back to legacy routing for infrastructure errors (beads down, etc.)
 		router := mail.NewRouter(workDir)
+		defer router.WaitPendingNotifications()
 		if err := router.Send(msg); err != nil {
 			return fmt.Errorf("sending message: %w", err)
 		}
@@ -143,6 +162,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 
 	// Route based on recipient type, collecting errors instead of failing early
 	router := mail.NewRouter(workDir)
+	defer router.WaitPendingNotifications()
 	var recipientAddrs []string
 	var sendErrs []string
 
@@ -170,6 +190,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			// Direct/agent messages: fan out to each recipient
 			msgCopy := *msg
 			msgCopy.To = rec.Address
+			msgCopy.ID = "" // Each fan-out copy gets its own unique ID
 			if err := router.Send(&msgCopy); err != nil {
 				sendErrs = append(sendErrs, fmt.Sprintf("%s: %v", rec.Address, err))
 				continue

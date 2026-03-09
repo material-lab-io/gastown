@@ -13,19 +13,22 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/runtime"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var hookCmd = &cobra.Command{
-	Use:     "hook [bead-id]",
-	Aliases: []string{"work"},
-	GroupID: GroupWork,
-	Short:   "Show or attach work on your hook",
+	Use:         "hook [bead-id] [target]",
+	Aliases:     []string{"work"},
+	GroupID:     GroupWork,
+	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
+	Short:       "Show or attach work on a hook",
 	Long: `Show what's on your hook, or attach new work.
 
 With no arguments, shows your current hook status (alias for 'gt mol status').
 With a bead ID, attaches that work to your hook.
+With a bead ID and target, attaches work to another agent's hook.
 
 The hook is the "durability primitive" - work on your hook survives session
 restarts, context compaction, and handoffs. When you restart (via gt handoff),
@@ -33,16 +36,17 @@ your SessionStart hook finds the attached work and you continue from where
 you left off.
 
 Examples:
-  gt hook                           # Show what's on my hook
-  gt hook status                    # Same as above
-  gt hook gt-abc                    # Attach issue gt-abc to your hook
-  gt hook gt-abc -s "Fix the bug"   # With subject for handoff mail
+  gt hook                                    # Show what's on my hook
+  gt hook status                             # Same as above
+  gt hook gt-abc                             # Attach issue gt-abc to your hook
+  gt hook gt-abc -s "Fix the bug"            # With subject for handoff mail
+  gt hook gt-abc gastown/crew/max            # Attach gt-abc to max's hook
 
 Related commands:
   gt sling <bead>    # Hook + start now (keep context)
   gt handoff <bead>  # Hook + restart (fresh context)
   gt unsling         # Remove work from hook`,
-	Args: cobra.MaximumNArgs(1),
+	Args: cobra.MaximumNArgs(2),
 	RunE: runHookOrStatus,
 }
 
@@ -88,6 +92,39 @@ Output format (one line):
 	RunE: runHookShow,
 }
 
+// hookAttachCmd attaches a bead to a hook (alias for 'gt hook <bead-id>')
+var hookAttachCmd = &cobra.Command{
+	Use:   "attach <bead-id> [target]",
+	Short: "Attach work to a hook",
+	Long: `Attach a bead to your hook or another agent's hook.
+
+With just a bead ID, attaches to your own hook (same as 'gt hook <bead-id>').
+With a target, attaches to another agent's hook (for remote dispatch).
+
+Examples:
+  gt hook attach gt-abc                    # Attach to my hook
+  gt hook attach gt-abc gastown/crew/max   # Attach to max's hook`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runHook(cmd, args)
+	},
+}
+
+// hookDetachCmd detaches a bead from a hook (alias for 'gt hook clear')
+var hookDetachCmd = &cobra.Command{
+	Use:   "detach <bead-id> [target]",
+	Short: "Detach work from a hook",
+	Long: `Remove a specific bead from a hook (same as 'gt hook clear <bead-id>').
+
+Examples:
+  gt hook detach gt-abc               # Detach gt-abc from my hook
+  gt hook detach gt-abc gastown/nux   # Detach gt-abc from nux's hook`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runUnslingWith(cmd, args, hookDryRun, hookForce)
+	},
+}
+
 // hookClearCmd clears the hook (alias for 'gt unhook')
 var hookClearCmd = &cobra.Command{
 	Use:   "clear [bead-id] [target]",
@@ -131,12 +168,20 @@ func init() {
 	hookStatusCmd.Flags().BoolVar(&moleculeJSON, "json", false, "Output as JSON")
 	hookShowCmd.Flags().BoolVar(&moleculeJSON, "json", false, "Output as JSON")
 
+	// Flags for attach subcommand
+	hookAttachCmd.Flags().BoolVarP(&hookForce, "force", "f", false, "Replace existing incomplete hooked bead")
+
+	// Flags for detach subcommand (mirror unsling flags)
+	hookDetachCmd.Flags().BoolVarP(&hookForce, "force", "f", false, "Detach even if work is incomplete")
+
 	// Flags for clear subcommand (mirror unsling flags)
 	hookClearCmd.Flags().BoolVarP(&hookDryRun, "dry-run", "n", false, "Show what would be done")
 	hookClearCmd.Flags().BoolVarP(&hookForce, "force", "f", false, "Clear even if work is incomplete")
 
 	hookCmd.AddCommand(hookStatusCmd)
 	hookCmd.AddCommand(hookShowCmd)
+	hookCmd.AddCommand(hookAttachCmd)
+	hookCmd.AddCommand(hookDetachCmd)
 	hookCmd.AddCommand(hookClearCmd)
 
 	rootCmd.AddCommand(hookCmd)
@@ -146,10 +191,7 @@ func init() {
 func runHookOrStatus(cmd *cobra.Command, args []string) error {
 	// --clear flag is alias for 'gt unhook'
 	if hookClear {
-		// Pass through dry-run and force flags
-		unslingDryRun = hookDryRun
-		unslingForce = hookForce
-		return runUnsling(cmd, args)
+		return runUnslingWith(cmd, args, hookDryRun, hookForce)
 	}
 	if len(args) == 0 {
 		// No args - show status
@@ -161,17 +203,29 @@ func runHookOrStatus(cmd *cobra.Command, args []string) error {
 
 // runHookClear handles 'gt hook clear' - delegates to runUnsling
 func runHookClear(cmd *cobra.Command, args []string) error {
-	// Pass through dry-run and force flags from hookClearCmd to unsling
-	unslingDryRun = hookDryRun
-	unslingForce = hookForce
-	return runUnsling(cmd, args)
+	return runUnslingWith(cmd, args, hookDryRun, hookForce)
 }
 
 func runHook(_ *cobra.Command, args []string) error {
 	beadID := args[0]
 
-	// Polecats cannot hook - they use gt done for lifecycle
-	if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" {
+	// Parse optional target agent
+	var targetAgent string
+	if len(args) > 1 {
+		targetAgent = args[1]
+	}
+
+	// Polecats cannot hook - they use gt done for lifecycle.
+	// Check GT_ROLE first: coordinators (mayor, witness, etc.) may have a stale
+	// GT_POLECAT in their environment from spawning polecats. Only block if the
+	// parsed role is actually polecat (handles compound forms like
+	// "gastown/polecats/Toast"). If GT_ROLE is unset, fall back to GT_POLECAT.
+	if role := os.Getenv("GT_ROLE"); role != "" {
+		parsedRole, _, _ := parseRoleString(role)
+		if parsedRole == RolePolecat {
+			return fmt.Errorf("polecats cannot hook work (use gt done for handoff)")
+		}
+	} else if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" {
 		return fmt.Errorf("polecats cannot hook work (use gt done for handoff)")
 	}
 
@@ -180,16 +234,50 @@ func runHook(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Determine agent identity
-	agentID, _, _, err := resolveSelfTarget()
-	if err != nil {
-		return fmt.Errorf("detecting agent identity: %w", err)
+	// Determine agent identity (target or self)
+	var agentID string
+	var err error
+	if targetAgent != "" {
+		agentID, _, _, err = resolveTargetAgent(targetAgent)
+		if err != nil {
+			return fmt.Errorf("resolving target agent: %w", err)
+		}
+	} else {
+		agentID, _, _, err = resolveSelfTarget()
+		if err != nil {
+			return fmt.Errorf("detecting agent identity: %w", err)
+		}
 	}
 
-	// Find beads directory
-	workDir, err := findLocalBeadsDir()
+	// Find town root - needed for bd routing and agent bead updates
+	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
-		return fmt.Errorf("not in a beads workspace: %w", err)
+		return fmt.Errorf("finding town root: %w", err)
+	}
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	// Resolve the beads directory for the target agent.
+	// For remote targets, resolve from the agent bead's prefix to find the
+	// correct database. For self, use the local beads directory.
+	var workDir string
+	if targetAgent != "" {
+		agentBeadID := agentIDToBeadID(agentID, townRoot)
+		if agentBeadID == "" {
+			return fmt.Errorf("could not convert agent ID %s to bead ID", agentID)
+		}
+		rigName := strings.Split(agentID, "/")[0]
+		var fallbackPath string
+		if rigName == "mayor" || rigName == "deacon" {
+			fallbackPath = townRoot
+		} else {
+			fallbackPath = filepath.Join(townRoot, rigName)
+		}
+		workDir = beads.ResolveHookDir(townRoot, agentBeadID, fallbackPath)
+	} else {
+		workDir, err = findLocalBeadsDir()
+		if err != nil {
+			return fmt.Errorf("not in a beads workspace: %w", err)
+		}
 	}
 
 	b := beads.New(workDir)
@@ -258,7 +346,11 @@ func runHook(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("%s Hooking %s...\n", style.Bold.Render("🪝"), beadID)
+	if targetAgent != "" {
+		fmt.Printf("%s Hooking %s for %s...\n", style.Bold.Render("🪝"), beadID, agentID)
+	} else {
+		fmt.Printf("%s Hooking %s...\n", style.Bold.Render("🪝"), beadID)
+	}
 
 	if hookDryRun {
 		fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, agentID)
@@ -271,13 +363,6 @@ func runHook(_ *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Find town root - needed for bd routing and agent bead updates
-	townRoot, err := workspace.FindFromCwd()
-	if err != nil {
-		return fmt.Errorf("finding town root: %w", err)
-	}
-	townBeadsDir := filepath.Join(townRoot, ".beads")
-
 	// Hook the bead using bd update with retry logic (discovery-based approach).
 	// Run from town root so bd can find routes.jsonl for prefix-based routing.
 	// This is essential for hooking convoys (hq-* prefix) stored in town beads.
@@ -288,10 +373,10 @@ func runHook(_ *cobra.Command, args []string) error {
 	const hookBackoffMax = 10 * time.Second
 	var lastHookErr error
 	for attempt := 1; attempt <= hookMaxRetries; attempt++ {
-		hookBdCmd := exec.Command("bd", "--no-daemon", "update", beadID, "--status=hooked", "--assignee="+agentID)
-		hookBdCmd.Dir = townRoot
-		hookBdCmd.Stderr = os.Stderr
-		if err := hookBdCmd.Run(); err != nil {
+		if err := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
+			Dir(townRoot).
+			WithAutoCommit().
+			Run(); err != nil {
 			lastHookErr = err
 			if attempt < hookMaxRetries {
 				backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
@@ -304,14 +389,22 @@ func runHook(_ *cobra.Command, args []string) error {
 		break
 	}
 
-	fmt.Printf("%s Work attached to hook (hooked bead)\n", style.Bold.Render("✓"))
+	if targetAgent != "" {
+		fmt.Printf("%s Work attached to %s's hook\n", style.Bold.Render("✓"), agentID)
+	} else {
+		fmt.Printf("%s Work attached to hook (hooked bead)\n", style.Bold.Render("✓"))
+	}
 
 	// Update agent bead's hook_bead field (matches gt sling behavior)
 	// This ensures gt hook / gt mol status can find hooked work via the agent bead
 	updateAgentHookBead(agentID, beadID, workDir, townBeadsDir)
 
-	fmt.Printf("  Use 'gt handoff' to restart with this work\n")
-	fmt.Printf("  Use 'gt hook' to see hook status\n")
+	if targetAgent != "" {
+		fmt.Printf("  Use 'gt hook show %s' to verify\n", targetAgent)
+	} else {
+		fmt.Printf("  Use 'gt handoff' to restart with this work\n")
+		fmt.Printf("  Use 'gt hook' to see hook status\n")
+	}
 
 	// Log hook event to activity feed (non-fatal)
 	if err := events.LogFeed(events.TypeHook, agentID, events.HookPayload(beadID)); err != nil {
@@ -352,7 +445,7 @@ func checkPinnedBeadComplete(b *beads.Beads, issue *beads.Issue) (isComplete boo
 func runHookShow(cmd *cobra.Command, args []string) error {
 	var target string
 	if len(args) > 0 {
-		target = args[0]
+		target = normalizeHookShowTarget(args[0])
 	} else {
 		// Auto-detect current agent from context
 		agentID, _, _, err := resolveSelfTarget()
@@ -369,7 +462,6 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	}
 
 	b := beads.New(workDir)
-
 	// Query for hooked beads assigned to the target
 	hookedBeads, err := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
@@ -438,12 +530,63 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// normalizeHookShowTarget resolves target aliases/shorthand to canonical agent IDs.
+// Examples:
+//   - "rig/polecat" -> "rig/polecats/polecat"
+//   - "mayor" -> "mayor"
+//
+// If resolution fails, it returns the original target unchanged.
+func normalizeHookShowTarget(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return target
+	}
+
+	// Use the same role/path resolver as dispatching commands, then convert
+	// the resulting tmux session back to a canonical assignee address.
+	// This keeps "hook show" target parsing aligned with sling/hook behavior.
+	if sessionName, err := resolveRoleToSession(target); err == nil && sessionName != "" {
+		if addr, ok := sessionNameToCanonicalAddress(sessionName, target); ok {
+			return addr
+		}
+	}
+
+	// Fallback for explicit/canonical addresses when resolver couldn't help.
+	if identity, err := session.ParseAddress(target); err == nil {
+		return identity.Address()
+	}
+	return target
+}
+
+// sessionNameToCanonicalAddress maps a tmux session name to a canonical agent
+// assignee address (e.g., "gastown/polecats/toast").
+//
+// targetHint is the original user input and is used to seed a temporary
+// prefix→rig mapping for deterministic parsing in tests or minimal
+// environments where the global session registry is not initialized.
+func sessionNameToCanonicalAddress(sessionName, targetHint string) (string, bool) {
+	if identity, err := session.ParseSessionName(sessionName); err == nil {
+		return identity.Address(), true
+	}
+
+	registry := session.NewPrefixRegistry()
+	for rig, prefix := range session.DefaultRegistry().AllRigs() {
+		registry.Register(prefix, rig)
+	}
+	parts := strings.Split(strings.TrimSpace(targetHint), "/")
+	if len(parts) >= 2 && parts[0] != "" {
+		rig := parts[0]
+		registry.Register(session.PrefixFor(rig), rig)
+	}
+
+	identity, err := session.ParseSessionNameWithRegistry(sessionName, registry)
+	if err != nil {
+		return "", false
+	}
+	return identity.Address(), true
+}
+
 // findTownRoot finds the Gas Town root directory.
 func findTownRoot() (string, error) {
-	cmd := exec.Command("gt", "root")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return workspace.FindFromCwd()
 }

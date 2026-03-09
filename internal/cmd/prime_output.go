@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -19,32 +20,39 @@ import (
 )
 
 // outputPrimeContext outputs the role-specific context using templates or fallback.
-func outputPrimeContext(ctx RoleContext) error {
+// Returns the rendered template content (empty string when using fallback path).
+func outputPrimeContext(ctx RoleContext) (string, error) {
 	// Try to use templates first
 	tmpl, err := templates.New()
 	if err != nil {
 		// Fall back to hardcoded output if templates fail
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Map role to template name
 	var roleName string
 	switch ctx.Role {
 	case RoleMayor:
-		roleName = "mayor"
+		roleName = constants.RoleMayor
 	case RoleDeacon:
-		roleName = "deacon"
+		roleName = constants.RoleDeacon
 	case RoleWitness:
-		roleName = "witness"
+		roleName = constants.RoleWitness
 	case RoleRefinery:
-		roleName = "refinery"
+		roleName = constants.RoleRefinery
 	case RolePolecat:
-		roleName = "polecat"
+		roleName = constants.RolePolecat
 	case RoleCrew:
-		roleName = "crew"
+		roleName = constants.RoleCrew
+	case RoleBoot:
+		roleName = "boot"
+	case RoleDog:
+		roleName = "dog"
 	default:
 		// Unknown role - use fallback
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Build template data
@@ -68,6 +76,7 @@ func outputPrimeContext(ctx RoleContext) error {
 		WorkDir:       ctx.WorkDir,
 		DefaultBranch: defaultBranch,
 		Polecat:       ctx.Polecat,
+		DogName:       ctx.Polecat, // ctx.Polecat holds the dog name for RoleDog
 		MayorSession:  session.MayorSessionName(),
 		DeaconSession: session.DeaconSessionName(),
 	}
@@ -75,14 +84,14 @@ func outputPrimeContext(ctx RoleContext) error {
 	// Render and output
 	output, err := tmpl.RenderRole(roleName, data)
 	if err != nil {
-		return fmt.Errorf("rendering template: %w", err)
+		return "", fmt.Errorf("rendering template: %w", err)
 	}
 
 	fmt.Print(output)
-	return nil
+	return output, nil
 }
 
-func outputPrimeContextFallback(ctx RoleContext) error {
+func outputPrimeContextFallback(ctx RoleContext) {
 	switch ctx.Role {
 	case RoleMayor:
 		outputMayorContext(ctx)
@@ -94,10 +103,11 @@ func outputPrimeContextFallback(ctx RoleContext) error {
 		outputPolecatContext(ctx)
 	case RoleCrew:
 		outputCrewContext(ctx)
+	case RoleBoot:
+		outputBootContext(ctx)
 	default:
 		outputUnknownContext(ctx)
 	}
-	return nil
 }
 
 func outputMayorContext(ctx RoleContext) {
@@ -123,6 +133,7 @@ func outputMayorContext(ctx RoleContext) {
 	fmt.Println("## Startup")
 	fmt.Println("Check for handoff messages with 🤝 HANDOFF in subject - continue predecessor's work.")
 	fmt.Println()
+	outputCommandQuickReference(ctx)
 	fmt.Printf("Town root: %s\n", style.Dim.Render(ctx.TownRoot))
 }
 
@@ -142,6 +153,7 @@ func outputWitnessContext(ctx RoleContext) {
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
 	fmt.Println()
+	outputCommandQuickReference(ctx)
 	fmt.Printf("Rig: %s\n", style.Dim.Render(ctx.Rig))
 }
 
@@ -162,6 +174,7 @@ func outputRefineryContext(ctx RoleContext) {
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
 	fmt.Println()
+	outputCommandQuickReference(ctx)
 	fmt.Printf("Rig: %s\n", style.Dim.Render(ctx.Rig))
 }
 
@@ -185,6 +198,7 @@ func outputPolecatContext(ctx RoleContext) {
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
 	fmt.Println()
+	outputCommandQuickReference(ctx)
 	fmt.Printf("Polecat: %s | Rig: %s\n",
 		style.Dim.Render(ctx.Polecat), style.Dim.Render(ctx.Rig))
 }
@@ -198,6 +212,9 @@ func outputCrewContext(ctx RoleContext) {
 	fmt.Println("- User-managed (not Witness-monitored)")
 	fmt.Println("- Long-lived identity across sessions")
 	fmt.Println()
+	fmt.Println("**Identity**: You are the AI agent. The human sending you messages is the")
+	fmt.Println("**Overseer** — the only non-agent role in Gas Town. Do not confuse your identity with theirs.")
+	fmt.Println()
 	fmt.Println("## Key Commands")
 	fmt.Println("- `" + cli.Name() + " mail inbox` - Check your inbox")
 	fmt.Println("- `bd ready` - Available issues")
@@ -208,8 +225,27 @@ func outputCrewContext(ctx RoleContext) {
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
 	fmt.Println()
+	outputCommandQuickReference(ctx)
 	fmt.Printf("Crew: %s | Rig: %s\n",
 		style.Dim.Render(ctx.Polecat), style.Dim.Render(ctx.Rig))
+}
+
+func outputBootContext(ctx RoleContext) {
+	fmt.Printf("%s\n\n", style.Bold.Render("# Boot Watchdog Context"))
+	fmt.Println("You are the **Boot Watchdog** - the daemon's entry point for Deacon triage.")
+	fmt.Println()
+	fmt.Println("## Responsibilities")
+	fmt.Println("- Observe Deacon session health")
+	fmt.Println("- Decide whether to wake, nudge, or restart the Deacon")
+	fmt.Println("- Run triage and exit (ephemeral - fresh each spawn)")
+	fmt.Println()
+	fmt.Println("## Key Commands")
+	fmt.Println("- `" + cli.Name() + " boot triage` - Run triage directly")
+	fmt.Println("- `" + cli.Name() + " boot status` - Show Boot status")
+	fmt.Println("- `" + cli.Name() + " deacon status` - Check Deacon health")
+	fmt.Println()
+	outputCommandQuickReference(ctx)
+	fmt.Printf("Town root: %s\n", style.Dim.Render(ctx.TownRoot))
 }
 
 func outputUnknownContext(ctx RoleContext) {
@@ -223,9 +259,92 @@ func outputUnknownContext(ctx RoleContext) {
 	fmt.Println("- `<rig>/polecats/<name>/` - Polecat role")
 	fmt.Println("- `<rig>/witness/rig/` - Witness role")
 	fmt.Println("- `<rig>/refinery/rig/` - Refinery role")
-	fmt.Println("- Town root or `mayor/` - Mayor role")
+	fmt.Println("- `mayor/` or `<rig>/mayor/` - Mayor role")
+	fmt.Println("- Town root is neutral (set GT_ROLE or cd into a role directory)")
 	fmt.Println()
 	fmt.Printf("Town root: %s\n", style.Dim.Render(ctx.TownRoot))
+}
+
+// outputCommandQuickReference outputs a compact role-aware cheatsheet of commonly
+// confused commands. This helps agents avoid guessing wrong commands.
+func outputCommandQuickReference(ctx RoleContext) {
+	c := cli.Name()
+	fmt.Println("## ⚡ Command Quick-Reference")
+	fmt.Println()
+	fmt.Println("**Commonly confused — use the right command:**")
+	fmt.Println()
+
+	switch ctx.Role {
+	case RoleMayor:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
+		fmt.Printf("| Dispatch work to polecat | `%s sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |\n", c)
+		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
+		fmt.Printf("| Kill stuck polecat | `%s polecat nuke <rig>/<name> --force` | ~~gt polecat kill~~ (not a command) |\n", c)
+		fmt.Printf("| Pause rig (daemon won't restart) | `%s rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |\n", c)
+		fmt.Printf("| Permanently disable rig | `%s rig dock <rig>` | ~~gt rig park~~ (temporary only) |\n", c)
+		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
+
+	case RoleCrew:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
+		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
+		fmt.Printf("| Dispatch work to polecat | `%s sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |\n", c)
+		fmt.Printf("| Stop my session | `%s crew stop %s` | ~~gt rig stop~~ (stops rig agents, not crew) |\n", c, ctx.Polecat)
+		fmt.Printf("| Pause rig (daemon won't restart) | `%s rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |\n", c)
+		fmt.Printf("| Permanently disable rig | `%s rig dock <rig>` | ~~gt rig park~~ (temporary only) |\n", c)
+
+	case RolePolecat:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Printf("| Signal work complete | `%s done` | ~~bd close <root-issue>~~ (Refinery closes it) |\n", c)
+		fmt.Println("| Close a sub-issue | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
+		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
+		fmt.Println("| Check workflow steps | `bd mol current` | ~~bd ready~~ (excludes molecule steps) |")
+		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
+		fmt.Printf("| Escalate blocker | `%s escalate \"desc\" -s HIGH` | ~~waiting for human~~ (never wait) |\n", c)
+
+	case RoleWitness:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
+		fmt.Printf("| Message a polecat | `%s nudge %s/<name> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c, ctx.Rig)
+		fmt.Printf("| Kill stuck polecat | `%s polecat nuke %s/<name> --force` | ~~gt polecat kill~~ (not a command) |\n", c, ctx.Rig)
+		fmt.Printf("| View polecat output | `%s peek %s/<name> 50` | |\n", c, ctx.Rig)
+		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
+
+	case RoleRefinery:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Printf("| Check merge queue | `%s mq list %s` | ~~git branch -r \\| grep polecat~~ (misses MRs) |\n", c, ctx.Rig)
+		fmt.Printf("| Message a polecat | `%s nudge %s/<name> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c, ctx.Rig)
+		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
+
+	case RoleDeacon:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Printf("| Start rig agents | `%s rig start <rig>` | ~~gt rig boot~~ (starts without patrol) |\n", c)
+		fmt.Printf("| Pause rig (daemon won't restart) | `%s rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |\n", c)
+		fmt.Printf("| Permanently disable rig | `%s rig dock <rig>` | ~~gt rig park~~ (temporary only) |\n", c)
+		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
+
+	case RoleBoot:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Printf("| Run triage | `%s boot triage` | ~~gt deacon heartbeat~~ (that's Deacon's job) |\n", c)
+		fmt.Printf("| Check Deacon health | `%s deacon status` | ~~gt status~~ (town-wide, not Deacon-specific) |\n", c)
+		fmt.Printf("| Nudge the Deacon | `%s nudge deacon \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
+	}
+
+	fmt.Println()
+	fmt.Println("**Rig lifecycle commands (park vs dock vs stop):**")
+	fmt.Println("- `park/unpark` — Temporary pause. Daemon skips parked rigs.")
+	fmt.Println("- `dock/undock` — Persistent disable. Survives daemon restarts.")
+	fmt.Println("- `stop/start` — Immediate stop/start of rig patrol agents (witness + refinery).")
+	fmt.Println("- `restart/reboot` — Stop then start rig agents.")
+	fmt.Println()
 }
 
 // outputContextFile reads and displays the CONTEXT.md file from the town root.
@@ -287,6 +406,13 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("   - If mol attached → **RUN IT** (no human input needed)")
 		fmt.Println("   - If no mol → await user instruction")
 	case RoleWitness:
+		if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
+			return
+		}
 		fmt.Println()
 		fmt.Println("---")
 		fmt.Println()
@@ -296,7 +422,7 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("3. Check mail: `" + cli.Name() + " mail inbox` - look for 🤝 HANDOFF messages")
 		fmt.Println("4. Check for attached patrol: `" + cli.Name() + " hook`")
 		fmt.Println("   - If mol attached → **RUN IT** (resume from current step)")
-		fmt.Println("   - If no mol → create patrol: `bd mol wisp mol-witness-patrol`")
+		fmt.Println("   - If no mol → create patrol: `" + cli.Name() + " patrol new`")
 	case RolePolecat:
 		fmt.Println()
 		fmt.Println("---")
@@ -308,10 +434,17 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("3. If you have mail with work instructions → execute that work")
 		fmt.Println("4. If NO mail → run `" + cli.Name() + " done` IMMEDIATELY")
 		fmt.Println()
-		fmt.Println("Polecats are ephemeral workers. No work on hook + no mail = terminate.")
+		fmt.Println("Polecat sessions are ephemeral. No work on hook + no mail = terminate.")
 		fmt.Println("DO NOT wait. DO NOT escalate. DO NOT send idle alerts.")
 		fmt.Println("Just run `" + cli.Name() + " done` and exit.")
 	case RoleRefinery:
+		if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
+			return
+		}
 		fmt.Println()
 		fmt.Println("---")
 		fmt.Println()
@@ -321,7 +454,7 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("3. Check mail: `" + cli.Name() + " mail inbox` - look for 🤝 HANDOFF messages")
 		fmt.Println("4. Check for attached patrol: `" + cli.Name() + " hook`")
 		fmt.Println("   - If mol attached → **RUN IT** (resume from current step)")
-		fmt.Println("   - If no mol → create patrol: `bd mol wisp mol-refinery-patrol`")
+		fmt.Println("   - If no mol → create patrol: `" + cli.Name() + " patrol new`")
 	case RoleCrew:
 		fmt.Println()
 		fmt.Println("---")
@@ -351,6 +484,14 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("5. Check for attached patrol: `" + cli.Name() + " hook`")
 		fmt.Println("   - If mol attached → **RUN IT** (resume from current step)")
 		fmt.Println("   - If no mol → create patrol: `bd mol wisp mol-deacon-patrol`")
+	case RoleBoot:
+		fmt.Println()
+		fmt.Println("---")
+		fmt.Println()
+		fmt.Println("**STARTUP PROTOCOL**: You are Boot. Please:")
+		fmt.Println("1. Run `" + cli.Name() + " prime` (loads full context)")
+		fmt.Println("2. Run `" + cli.Name() + " boot triage` immediately")
+		fmt.Println("3. When triage completes, exit cleanly")
 	}
 }
 
@@ -405,8 +546,29 @@ func outputAttachmentStatus(ctx RoleContext) {
 	}
 	fmt.Println()
 
-	// Show current step from molecule
-	showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+	// Show inline formula steps if formula name is known, else fall back to bd mol current
+	if attachment.AttachedFormula != "" {
+		showFormulaStepsFull(attachment.AttachedFormula)
+	} else {
+		showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+	}
+}
+
+// outputContinuationDirective displays a brief continuation prompt for post-compact/resume.
+// Unlike outputAutonomousDirective, this does NOT ask the agent to re-announce or
+// re-run startup protocol — it just reminds the agent what's on the hook. (GH#1965)
+func outputContinuationDirective(hookedBead *beads.Issue, hasMolecule bool) {
+	fmt.Println()
+	fmt.Printf("%s\n\n", style.Bold.Render("## ▶ CONTINUE HOOKED WORK"))
+	fmt.Println("Your context was compacted/resumed. **Continue working on your hooked bead.**")
+	fmt.Println("Do NOT re-announce, re-initialize, or re-read the bead from scratch.")
+	fmt.Println("Pick up where you left off.")
+	fmt.Println()
+	fmt.Printf("  Hooked: %s — %s\n", style.Bold.Render(hookedBead.ID), hookedBead.Title)
+	if hasMolecule {
+		fmt.Println("  (Has attached molecule — check `bd mol current` for next step)")
+	}
+	fmt.Println()
 }
 
 // outputHandoffWarning outputs the post-handoff warning message.

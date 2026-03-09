@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -101,30 +103,30 @@ func detectSenderFromRole(role string) string {
 
 	// GT_ROLE is a simple role name, build the full address
 	switch role {
-	case "mayor":
+	case constants.RoleMayor:
 		return "mayor/"
-	case "deacon":
+	case constants.RoleDeacon:
 		return "deacon/"
-	case "polecat":
+	case constants.RolePolecat:
 		polecat := os.Getenv("GT_POLECAT")
 		if rig != "" && polecat != "" {
 			return fmt.Sprintf("%s/%s", rig, polecat)
 		}
 		// Fallback to cwd detection for polecats
 		return detectSenderFromCwd()
-	case "crew":
+	case constants.RoleCrew:
 		crew := os.Getenv("GT_CREW")
 		if rig != "" && crew != "" {
 			return fmt.Sprintf("%s/crew/%s", rig, crew)
 		}
 		// Fallback to cwd detection for crew
 		return detectSenderFromCwd()
-	case "witness":
+	case constants.RoleWitness:
 		if rig != "" {
 			return fmt.Sprintf("%s/witness", rig)
 		}
 		return detectSenderFromCwd()
-	case "refinery":
+	case constants.RoleRefinery:
 		if rig != "" {
 			return fmt.Sprintf("%s/refinery", rig)
 		}
@@ -140,6 +142,12 @@ func detectSenderFromCwd() string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "overseer"
+	}
+
+	// Prefer explicit agent identity metadata when available.
+	// This avoids brittle path parsing from nested agent dirs (for example witness/rig).
+	if fromFile := detectSenderFromAgentFile(cwd); fromFile != "" {
+		return fromFile
 	}
 
 	// If in a rig's polecats directory, extract address (format: rig/polecats/name)
@@ -189,4 +197,63 @@ func detectSenderFromCwd() string {
 
 	// Default to overseer (human)
 	return "overseer"
+}
+
+type agentIdentityFile struct {
+	Role string `json:"role"`
+	Rig  string `json:"rig"`
+	Name string `json:"name"`
+}
+
+func detectSenderFromAgentFile(startDir string) string {
+	path := startDir
+	for {
+		agentPath := filepath.Join(path, ".gt-agent")
+		data, err := os.ReadFile(agentPath)
+		if err == nil {
+			var parsed agentIdentityFile
+			if json.Unmarshal(data, &parsed) == nil {
+				if id := identityFromAgentFile(parsed); id != "" {
+					return id
+				}
+			}
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+	}
+	return ""
+}
+
+func identityFromAgentFile(parsed agentIdentityFile) string {
+	role := strings.TrimSpace(strings.ToLower(parsed.Role))
+	rig := strings.TrimSpace(parsed.Rig)
+	name := strings.TrimSpace(parsed.Name)
+
+	switch role {
+	case constants.RoleMayor:
+		return "mayor/"
+	case constants.RoleDeacon:
+		return "deacon/"
+	case constants.RoleWitness:
+		if rig != "" {
+			return fmt.Sprintf("%s/witness", rig)
+		}
+	case constants.RoleRefinery:
+		if rig != "" {
+			return fmt.Sprintf("%s/refinery", rig)
+		}
+	case constants.RoleCrew:
+		if rig != "" && name != "" {
+			return fmt.Sprintf("%s/crew/%s", rig, name)
+		}
+	case constants.RolePolecat:
+		if rig != "" && name != "" {
+			return fmt.Sprintf("%s/polecats/%s", rig, name)
+		}
+	}
+
+	return ""
 }

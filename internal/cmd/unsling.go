@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -51,6 +52,10 @@ func init() {
 }
 
 func runUnsling(cmd *cobra.Command, args []string) error {
+	return runUnslingWith(cmd, args, unslingDryRun, unslingForce)
+}
+
+func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error {
 	var targetBeadID string
 	var targetAgent string
 
@@ -99,9 +104,8 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 	}
 
 	// Resolve the correct beads directory using prefix-based routing.
-	// This matches how updateAgentHookBead resolves the directory when setting
-	// the hook (via beads.ResolveHookDir). Town-level agents (mayor, deacon)
-	// fall back to townRoot since their beads use hq- prefix stored at town level.
+	// Town-level agents (mayor, deacon) fall back to townRoot since their
+	// beads use hq- prefix stored at town level.
 	rigName := strings.Split(agentID, "/")[0]
 	var fallbackPath string
 	if rigName == "mayor" || rigName == "deacon" {
@@ -113,35 +117,44 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 
 	b := beads.New(beadsPath)
 
-	// Get the agent bead to find current hook.
-	// The agent bead may not exist (e.g., crew members whose agent beads haven't
-	// been created yet). This is NOT a fatal error - we fall back to querying
-	// for hooked beads by status.
-	var agentBead *beads.Issue
-	agentBead, err = b.Show(agentBeadID)
-	if err != nil {
-		// Agent bead not found - this is OK, we'll fall back to status query
-		agentBead = nil
-	}
-
-	// Check if agent has work hooked (via hook_bead field on agent bead)
+	// Find hooked bead by querying status+assignee directly (hq-l6mm5).
+	// The work bead itself is the authoritative source — no need to read
+	// the agent bead's hook_bead slot.
 	hookedBeadID := ""
-	if agentBead != nil {
-		hookedBeadID = agentBead.HookBead
+	hookedBeads, listErr := b.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Assignee: agentID,
+		Priority: -1,
+	})
+	if listErr == nil && len(hookedBeads) > 0 {
+		hookedBeadID = hookedBeads[0].ID
 	}
 
-	// Fallback: if hook_bead is empty (cleared or agent bead missing), query for
-	// beads that still have status=hooked assigned to this agent. This catches
-	// stale hooked beads where hook_bead was cleared but bead status wasn't reset.
-	// This matches the fallback behavior in runMoleculeStatus.
-	if hookedBeadID == "" {
-		hookedBeads, listErr := b.List(beads.ListOptions{
+	// Town-level fallback: rig-level agents (polecats, crew) may have hooked
+	// HQ beads (hq-* prefix) stored in townRoot/.beads, not the rig's database.
+	// Without this, gt unsling can't find or clear these beads, even though
+	// gt mol status / gt hook (display) can see them. (gt-dtq7)
+	if hookedBeadID == "" && !isTownLevelRole(agentID) && townRoot != "" {
+		townB := beads.New(filepath.Join(townRoot, ".beads"))
+		// Search with the exact agent ID
+		if townHooked, err := townB.List(beads.ListOptions{
 			Status:   beads.StatusHooked,
 			Assignee: agentID,
 			Priority: -1,
-		})
-		if listErr == nil && len(hookedBeads) > 0 {
-			hookedBeadID = hookedBeads[0].ID
+		}); err == nil && len(townHooked) > 0 {
+			hookedBeadID = townHooked[0].ID
+		} else {
+			// Also search with normalized identity (mail beads use normalized form)
+			normalizedID := mailNormalizedAgentID(agentID)
+			if normalizedID != agentID {
+				if townHooked, err := townB.List(beads.ListOptions{
+					Status:   beads.StatusHooked,
+					Assignee: normalizedID,
+					Priority: -1,
+				}); err == nil && len(townHooked) > 0 {
+					hookedBeadID = townHooked[0].ID
+				}
+			}
 		}
 	}
 
@@ -149,7 +162,7 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 		// hook_bead is empty, but there may be stale beads with status "hooked"
 		// still assigned to this agent (e.g., hook_bead was cleared but bead status
 		// wasn't updated). Clean them up so gt hook and gt unsling stay consistent.
-		cleaned := cleanStaleHookedBeads(cmd, b, agentID, targetBeadID, townRoot, beadsPath)
+		cleaned := cleanStaleHookedBeads(cmd, b, agentID, targetBeadID, townRoot, beadsPath, dryRun)
 		if !cleaned {
 			if targetAgent != "" {
 				fmt.Printf("%s No work hooked for %s\n", style.Dim.Render("ℹ"), agentID)
@@ -176,7 +189,7 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 	hookedBead, err := hookedB.Show(hookedBeadID)
 	if err != nil {
 		// Bead might be deleted - still allow unsling with --force
-		if !unslingForce {
+		if !force {
 			return fmt.Errorf("getting hooked bead %s: %w\n  Use --force to unsling anyway", hookedBeadID, err)
 		}
 		// Force mode - proceed without the bead details
@@ -185,7 +198,7 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 
 	// Check if work is complete (warn if not, unless --force)
 	isComplete := hookedBead.Status == "closed"
-	if !isComplete && !unslingForce {
+	if !isComplete && !force {
 		return fmt.Errorf("hooked work %s is incomplete (%s)\n  Use --force to unsling anyway",
 			hookedBeadID, hookedBead.Title)
 	}
@@ -196,19 +209,12 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Unslinging %s...\n", style.Bold.Render("🪝"), hookedBeadID)
 	}
 
-	if unslingDryRun {
-		fmt.Printf("Would clear hook_bead from agent bead %s\n", agentBeadID)
+	if dryRun {
+		fmt.Printf("Would unsling hooked bead from %s\n", agentID)
 		return nil
 	}
 
-	// Clear the hook from agent bead if it exists (gt-zecmc: removed agent_state update)
-	if agentBead != nil {
-		if err := b.ClearHookBead(agentBeadID); err != nil {
-			// Non-fatal: the hook_bead field may already be cleared.
-			// The bead status update below is the more important cleanup.
-			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: couldn't clear hook from agent bead %s: %v\n", agentBeadID, err)
-		}
-	}
+	// No ClearHookBead call needed — agent bead hook slot is no longer maintained (hq-l6mm5).
 
 	// Update hooked bead status from "hooked" back to "open".
 	// Previously, only the agent's hook slot was cleared but the bead itself stayed
@@ -243,14 +249,47 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 // bead's status wasn't updated back to "open". Without this, gt hook shows the
 // stale hook (via fallback query) but gt unsling says "Nothing on your hook".
 // Returns true if any stale beads were cleaned up.
-func cleanStaleHookedBeads(cmd *cobra.Command, b *beads.Beads, agentID, targetBeadID, townRoot, beadsPath string) bool {
-	// Query for beads with status=hooked assigned to this agent
+func cleanStaleHookedBeads(cmd *cobra.Command, b *beads.Beads, agentID, targetBeadID, townRoot, beadsPath string, dryRun bool) bool {
+	// Collect stale beads from local rig beads
 	staleBeads, err := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: agentID,
 		Priority: -1,
 	})
-	if err != nil || len(staleBeads) == 0 {
+	if err != nil {
+		staleBeads = nil
+	}
+
+	// Also search town-level beads for rig-level agents (gt-dtq7).
+	// HQ beads (hq-* prefix) live in townRoot/.beads, not the rig database.
+	// Without this, stale HQ beads hooked to crew/polecats are invisible to cleanup.
+	if !isTownLevelRole(agentID) && townRoot != "" {
+		townBeadsPath := filepath.Join(townRoot, ".beads")
+		if townBeadsPath != beadsPath {
+			townB := beads.New(townBeadsPath)
+			// Search with exact agent ID
+			if townStale, err := townB.List(beads.ListOptions{
+				Status:   beads.StatusHooked,
+				Assignee: agentID,
+				Priority: -1,
+			}); err == nil {
+				staleBeads = append(staleBeads, townStale...)
+			}
+			// Also search with normalized identity (mail beads use normalized form)
+			normalizedID := mailNormalizedAgentID(agentID)
+			if normalizedID != agentID {
+				if townStale, err := townB.List(beads.ListOptions{
+					Status:   beads.StatusHooked,
+					Assignee: normalizedID,
+					Priority: -1,
+				}); err == nil {
+					staleBeads = append(staleBeads, townStale...)
+				}
+			}
+		}
+	}
+
+	if len(staleBeads) == 0 {
 		return false
 	}
 
@@ -268,7 +307,7 @@ func cleanStaleHookedBeads(cmd *cobra.Command, b *beads.Beads, agentID, targetBe
 		staleBeads = filtered
 	}
 
-	if unslingDryRun {
+	if dryRun {
 		for _, sb := range staleBeads {
 			fmt.Printf("Would clean up stale hooked bead %s (%s)\n", sb.ID, sb.Title)
 		}
@@ -300,6 +339,17 @@ func cleanStaleHookedBeads(cmd *cobra.Command, b *beads.Beads, agentID, targetBe
 	return true
 }
 
+// mailNormalizedAgentID normalizes crew/polecats path to the canonical form
+// used by sendHandoffMail (via mail.AddressToIdentity).
+// "rig/crew/name" → "rig/name", "rig/polecats/name" → "rig/name".
+func mailNormalizedAgentID(agentID string) string {
+	parts := strings.Split(agentID, "/")
+	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
+		return parts[0] + "/" + parts[2]
+	}
+	return agentID
+}
+
 // isAgentTarget checks if a string looks like an agent target rather than a bead ID.
 // Agent targets contain "/" or are known role names.
 func isAgentTarget(s string) bool {
@@ -312,7 +362,7 @@ func isAgentTarget(s string) bool {
 
 	// Known role names
 	switch s {
-	case "mayor", "deacon", "witness", "refinery", "crew":
+	case constants.RoleMayor, constants.RoleDeacon, constants.RoleWitness, constants.RoleRefinery, constants.RoleCrew:
 		return true
 	}
 

@@ -1,18 +1,29 @@
 // Package mail provides address resolution for beads-native messaging.
 // This module implements the resolution order:
-// 1. Contains '/' → agent address or pattern
+// 1. Explicit prefix (group:, queue:, channel:, list:, announce:)
 // 2. Starts with '@' → special pattern (@town, @crew, @rig/X, @role/X)
-// 3. Otherwise → lookup by name: group → queue → channel
-// 4. If conflict, require prefix (group:X, queue:X, channel:X)
+// 3. Contains '/' → agent address or pattern (validated against known agents)
+// 4. Otherwise → lookup by name: group → queue → channel
+// 5. If conflict, require prefix (group:X, queue:X, channel:X)
 package mail
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/constants"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 )
+
+// ErrUnknownRecipient indicates the address does not match any known agent.
+// Callers should NOT fall back to legacy routing on this error — the address
+// is definitively invalid, not just unresolvable by the new resolver.
+var ErrUnknownRecipient = errors.New("unknown recipient")
 
 // RecipientType indicates the type of resolved recipient.
 type RecipientType string
@@ -51,10 +62,15 @@ func NewResolver(b *beads.Beads, townRoot string) *Resolver {
 // 3. Starts with explicit prefix → use that type (group:, queue:, channel:)
 // 4. Otherwise → lookup by name: group → queue → channel
 func (r *Resolver) Resolve(address string) ([]Recipient, error) {
+	return r.resolveWithVisited(address, make(map[string]bool))
+}
+
+// resolveWithVisited resolves an address while threading cycle detection state.
+func (r *Resolver) resolveWithVisited(address string, visited map[string]bool) ([]Recipient, error) {
 	// 1. Explicit prefix takes precedence
 	if strings.HasPrefix(address, "group:") {
 		name := strings.TrimPrefix(address, "group:")
-		return r.resolveBeadsGroup(name)
+		return r.resolveBeadsGroupWithVisited(name, visited)
 	}
 	if strings.HasPrefix(address, "queue:") {
 		name := strings.TrimPrefix(address, "queue:")
@@ -71,18 +87,18 @@ func (r *Resolver) Resolve(address string) ([]Recipient, error) {
 		return []Recipient{{Address: address, Type: RecipientAgent}}, nil
 	}
 
-	// 2. Contains '/' → agent address or pattern
+	// 2. Starts with '@' → special pattern (check before '/' since @rig/X contains '/')
+	if strings.HasPrefix(address, "@") {
+		return r.resolveAtPatternWithVisited(address, visited)
+	}
+
+	// 3. Contains '/' → agent address or pattern
 	if strings.Contains(address, "/") {
 		return r.resolveAgentAddress(address)
 	}
 
-	// 3. Starts with '@' → special pattern
-	if strings.HasPrefix(address, "@") {
-		return r.resolveAtPattern(address)
-	}
-
 	// 4. Name lookup: group → queue → channel
-	return r.resolveByName(address)
+	return r.resolveByNameWithVisited(address, visited)
 }
 
 // resolveAgentAddress handles addresses containing '/'.
@@ -93,11 +109,98 @@ func (r *Resolver) resolveAgentAddress(address string) ([]Recipient, error) {
 		return r.resolvePattern(address)
 	}
 
+	// Validate that the address refers to a known agent before accepting.
+	// Without this check, typos like "laser/mayor" (instead of "mayor/")
+	// silently deliver to a dead inbox with no error.
+	// See: https://github.com/steveyegge/gastown/issues/2038
+	if err := r.validateAgentAddress(address); err != nil {
+		return nil, err
+	}
+
 	// Direct address - single recipient
 	return []Recipient{{
 		Address: address,
 		Type:    RecipientAgent,
 	}}, nil
+}
+
+// validateAgentAddress checks that a slash-containing address corresponds to
+// a known agent. It checks well-known singletons, agent beads, and workspace
+// directories. Returns nil if the agent exists, or an error with suggestions.
+// If neither beads nor townRoot is available, validation is skipped (graceful
+// degradation) and downstream validation in sendToSingle handles it.
+func (r *Resolver) validateAgentAddress(address string) error {
+	// Skip validation when we have no data sources to check against.
+	// This preserves backward compatibility when the Resolver is used
+	// without a fully configured environment.
+	if r.beads == nil && r.townRoot == "" {
+		return nil
+	}
+
+	normalized := normalizeAddress(strings.TrimSuffix(address, "/"))
+
+	// Well-known town-level singletons always valid
+	switch normalized {
+	case constants.RoleMayor + "/", constants.RoleMayor, constants.RoleDeacon + "/", constants.RoleDeacon, "overseer":
+		return nil
+	}
+
+	parts := strings.SplitN(normalized, "/", 3)
+	if len(parts) < 2 || parts[1] == "" {
+		return fmt.Errorf("%w: %s", ErrUnknownRecipient, address)
+	}
+
+	// Well-known rig-level singletons (rig/witness, rig/refinery)
+	if len(parts) == 2 {
+		switch parts[1] {
+		case constants.RoleWitness, constants.RoleRefinery:
+			return nil
+		}
+	}
+
+	// Check agent beads if available
+	if r.beads != nil {
+		agents, err := r.beads.ListAgentBeads()
+		if err == nil {
+			for id := range agents {
+				addr := AgentBeadIDToAddress(id)
+				if addr != "" && normalizeAddress(addr) == normalized {
+					return nil
+				}
+			}
+		}
+	}
+
+	// Check workspace directories as fallback
+	if r.townRoot != "" {
+		switch len(parts) {
+		case 2:
+			rig, name := parts[0], parts[1]
+			// Singleton role: rig/name (e.g., gastown/witness)
+			if dirExistsAt(filepath.Join(r.townRoot, rig, name)) {
+				return nil
+			}
+			// Named agent (normalized, could be crew or polecat)
+			for _, role := range []string{"crew", "polecats"} {
+				if dirExistsAt(filepath.Join(r.townRoot, rig, role, name)) {
+					return nil
+				}
+			}
+		case 3:
+			// Explicit: rig/crew/name or rig/polecats/name
+			if dirExistsAt(filepath.Join(r.townRoot, parts[0], parts[1], parts[2])) {
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("%w: %s (no matching agent or workspace found)", ErrUnknownRecipient, address)
+}
+
+// dirExistsAt returns true if path exists and is a directory.
+func dirExistsAt(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // resolvePattern expands a wildcard pattern to matching agents.
@@ -116,7 +219,7 @@ func (r *Resolver) resolvePattern(pattern string) ([]Recipient, error) {
 	var recipients []Recipient
 	for id := range agents {
 		// Convert bead ID to address and check match
-		addr := agentBeadIDToAddress(id)
+		addr := AgentBeadIDToAddress(id)
 		if addr != "" && matchPattern(pattern, addr) {
 			recipients = append(recipients, Recipient{
 				Address: addr,
@@ -135,16 +238,21 @@ func (r *Resolver) resolvePattern(pattern string) ([]Recipient, error) {
 // resolveAtPattern handles @-prefixed patterns.
 // These include @town, @crew, @rig/X, @role/X, @overseer.
 func (r *Resolver) resolveAtPattern(address string) ([]Recipient, error) {
+	return r.resolveAtPatternWithVisited(address, make(map[string]bool))
+}
+
+// resolveAtPatternWithVisited handles @-prefixed patterns with cycle detection.
+func (r *Resolver) resolveAtPatternWithVisited(address string, visited map[string]bool) ([]Recipient, error) {
 	// First check if this is a beads-native group (if beads available)
 	if r.beads != nil {
 		groupName := strings.TrimPrefix(address, "@")
-		issue, fields, err := r.beads.LookupGroupByName(groupName)
-		if err != nil {
+		_, fields, err := r.beads.LookupGroupByName(groupName)
+		if err != nil && !errors.Is(err, beads.ErrNotFound) {
 			return nil, err
 		}
-		if issue != nil && fields != nil {
+		if err == nil && fields != nil {
 			// Found a beads-native group - expand its members
-			return r.expandGroupMembers(fields)
+			return r.expandGroupMembersWithVisited(fields, visited)
 		}
 	}
 
@@ -156,16 +264,21 @@ func (r *Resolver) resolveAtPattern(address string) ([]Recipient, error) {
 // resolveByName looks up a name as group → queue → channel.
 // Returns error if name conflicts exist without explicit prefix.
 func (r *Resolver) resolveByName(name string) ([]Recipient, error) {
+	return r.resolveByNameWithVisited(name, make(map[string]bool))
+}
+
+// resolveByNameWithVisited looks up a name with cycle detection.
+func (r *Resolver) resolveByNameWithVisited(name string, visited map[string]bool) ([]Recipient, error) {
 	var foundGroup, foundQueue, foundChannel bool
 	var groupFields *beads.GroupFields
 
 	// Check for beads-native group
 	if r.beads != nil {
 		_, fields, err := r.beads.LookupGroupByName(name)
-		if err != nil {
+		if err != nil && !errors.Is(err, beads.ErrNotFound) {
 			return nil, err
 		}
-		if fields != nil {
+		if err == nil && fields != nil {
 			foundGroup = true
 			groupFields = fields
 		}
@@ -239,7 +352,7 @@ func (r *Resolver) resolveByName(name string) ([]Recipient, error) {
 
 	// Single match - resolve it
 	if foundGroup {
-		return r.expandGroupMembers(groupFields)
+		return r.expandGroupMembersWithVisited(groupFields, visited)
 	}
 	if foundQueue {
 		return r.resolveQueue(name)
@@ -249,19 +362,24 @@ func (r *Resolver) resolveByName(name string) ([]Recipient, error) {
 
 // resolveBeadsGroup resolves a beads-native group by name.
 func (r *Resolver) resolveBeadsGroup(name string) ([]Recipient, error) {
+	return r.resolveBeadsGroupWithVisited(name, make(map[string]bool))
+}
+
+// resolveBeadsGroupWithVisited resolves a beads-native group with cycle detection.
+func (r *Resolver) resolveBeadsGroupWithVisited(name string, visited map[string]bool) ([]Recipient, error) {
 	if r.beads == nil {
 		return nil, fmt.Errorf("beads not available")
 	}
 
 	_, fields, err := r.beads.LookupGroupByName(name)
 	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil, fmt.Errorf("group not found: %s", name)
+		}
 		return nil, err
 	}
-	if fields == nil {
-		return nil, fmt.Errorf("group not found: %s", name)
-	}
 
-	return r.expandGroupMembers(fields)
+	return r.expandGroupMembersWithVisited(fields, visited)
 }
 
 // expandGroupMembers expands a group's members to recipients.
@@ -318,8 +436,8 @@ func (r *Resolver) resolveMemberWithVisited(member string, visited map[string]bo
 		}
 	}
 
-	// Otherwise resolve normally
-	return r.Resolve(member)
+	// Otherwise resolve with the same visited map to maintain cycle detection
+	return r.resolveWithVisited(member, visited)
 }
 
 // resolveQueue returns a queue recipient.
@@ -340,12 +458,12 @@ func (r *Resolver) resolveChannel(name string) ([]Recipient, error) {
 	}}, nil
 }
 
-// agentBeadIDToAddress converts an agent bead ID to a mail address.
+// AgentBeadIDToAddress converts an agent bead ID to a mail address.
 // Handles both gt- (rig agents) and hq- (town agents) prefixes:
 //   - hq-mayor → mayor/
 //   - hq-deacon → deacon/
 //   - gt-gastown-crew-max → gastown/crew/max
-func agentBeadIDToAddress(id string) string {
+func AgentBeadIDToAddress(id string) string {
 	var rest string
 
 	// Handle both gt- (rig agents) and hq- (town agents) prefixes
@@ -357,23 +475,45 @@ func agentBeadIDToAddress(id string) string {
 		return ""
 	}
 
+	// Agent bead IDs include the role explicitly: <prefix>-<rig>-<role>[-<name>]
+	// Scan from right for known role markers to handle hyphenated rig names.
 	parts := strings.Split(rest, "-")
 
-	switch len(parts) {
-	case 1:
+	if len(parts) == 1 {
 		// Town-level: gt-mayor → mayor/
 		return parts[0] + "/"
-	case 2:
-		// Rig singleton: gt-gastown-witness → gastown/witness
-		return parts[0] + "/" + parts[1]
-	default:
-		// Rig named agent: gt-gastown-crew-max → gastown/crew/max
-		if len(parts) >= 3 {
-			name := strings.Join(parts[2:], "-")
-			return parts[0] + "/" + parts[1] + "/" + name
-		}
-		return ""
 	}
+
+	// Scan from right for known role markers
+	for i := len(parts) - 1; i >= 1; i-- {
+		switch parts[i] {
+		case constants.RoleWitness, constants.RoleRefinery:
+			// Singleton role: rig is everything before the role
+			rig := strings.Join(parts[:i], "-")
+			return rig + "/" + parts[i]
+		case constants.RoleCrew, constants.RolePolecat:
+			// Named role: rig/role/name
+			rig := strings.Join(parts[:i], "-")
+			if i+1 < len(parts) {
+				name := strings.Join(parts[i+1:], "-")
+				return rig + "/" + parts[i] + "/" + name
+			}
+			return rig + "/" + parts[i]
+		case "dog":
+			// Town-level named: gt-dog-alpha
+			if i+1 < len(parts) {
+				name := strings.Join(parts[i+1:], "-")
+				return "dog/" + name
+			}
+			return "dog/"
+		}
+	}
+
+	// Fallback: assume rig/role format
+	if len(parts) == 2 {
+		return parts[0] + "/" + parts[1]
+	}
+	return ""
 }
 
 // matchPattern checks if an address matches a wildcard pattern.

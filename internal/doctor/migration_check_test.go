@@ -1,864 +1,298 @@
 package doctor
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestMigrationReadinessCheck_AllDolt(t *testing.T) {
-	// Create temp directory structure
-	tmpDir := t.TempDir()
-
-	// Create .beads directory with Dolt metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
+// setupDoltDB creates a fake Dolt database directory under .dolt-data/.
+func setupDoltDB(t *testing.T, townRoot, dbName string) {
+	t.Helper()
+	nomsDir := filepath.Join(townRoot, ".dolt-data", dbName, ".dolt", "noms")
+	if err := os.MkdirAll(nomsDir, 0755); err != nil {
+		t.Fatalf("creating noms dir for %s: %v", dbName, err)
 	}
-
-	// Write Dolt metadata
-	metadata := `{"backend": "dolt", "database": "dolt"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create dolt directory to make it fully migrated
-	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create mayor directory with empty rigs.json
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"version": 1, "rigs": {}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewMigrationReadinessCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK, got %v: %s", result.Status, result.Message)
-	}
-
-	readiness := check.Readiness()
-	if !readiness.Ready {
-		t.Errorf("Expected Ready=true, got false. Blockers: %v", readiness.Blockers)
+	if err := os.WriteFile(filepath.Join(nomsDir, "manifest"), []byte("test"), 0644); err != nil {
+		t.Fatalf("writing manifest for %s: %v", dbName, err)
 	}
 }
 
-func TestMigrationReadinessCheck_SQLiteNeedsMigration(t *testing.T) {
-	// Create temp directory structure
-	tmpDir := t.TempDir()
-
-	// Create .beads directory with SQLite metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
+// setupRigMetadata creates a .beads/metadata.json for a rig with Dolt server config.
+func setupRigMetadata(t *testing.T, townRoot, rigName, doltDatabase string) {
+	t.Helper()
+	var beadsDir string
+	if rigName == "hq" {
+		beadsDir = filepath.Join(townRoot, ".beads")
+	} else {
+		beadsDir = filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	}
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
+		t.Fatalf("creating beads dir for %s: %v", rigName, err)
 	}
-
-	// Write SQLite metadata (or no backend field = defaults to SQLite)
-	metadata := `{"backend": "sqlite", "database": "sqlite3"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
+	meta := map[string]interface{}{
+		"backend":       "dolt",
+		"dolt_mode":     "server",
+		"dolt_database": doltDatabase,
 	}
-
-	// Create a beads.db to make it recognizable
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte(""), 0644); err != nil {
-		t.Fatal(err)
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshaling metadata for %s: %v", rigName, err)
 	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+		t.Fatalf("writing metadata for %s: %v", rigName, err)
+	}
+}
 
-	// Create mayor directory with empty rigs.json
-	mayorDir := filepath.Join(tmpDir, "mayor")
+// setupServerMetadata creates a .beads/metadata.json with optional host/port fields.
+func setupServerMetadata(t *testing.T, beadsDir, host string, port int) {
+	t.Helper()
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("creating beads dir: %v", err)
+	}
+	meta := map[string]interface{}{
+		"backend":       "dolt",
+		"dolt_mode":     "server",
+		"dolt_database": "test",
+	}
+	if host != "" {
+		meta["dolt_server_host"] = host
+	}
+	if port != 0 {
+		meta["dolt_server_port"] = port
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshaling metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+}
+
+// setupRigsJSON creates a minimal mayor/rigs.json for tests.
+func setupRigsJSON(t *testing.T, townRoot string, rigNames []string) {
+	t.Helper()
+	mayorDir := filepath.Join(townRoot, "mayor")
 	if err := os.MkdirAll(mayorDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	rigsJSON := `{"version": 1, "rigs": {}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewMigrationReadinessCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusError {
-		t.Errorf("Expected StatusError for SQLite backend, got %v: %s", result.Status, result.Message)
-	}
-
-	readiness := check.Readiness()
-	if readiness.Ready {
-		t.Errorf("Expected Ready=false for SQLite backend, got true")
-	}
-
-	// Check that town-root rig is in the list
-	found := false
-	for _, rig := range readiness.Rigs {
-		if rig.Name == "town-root" && rig.NeedsMigration {
-			found = true
-			if rig.State != StateNeverMigrated {
-				t.Errorf("Expected state never-migrated, got %s", rig.State)
-			}
-			break
+	rigs := "{"
+	for i, name := range rigNames {
+		if i > 0 {
+			rigs += ","
 		}
+		rigs += `"` + name + `":{"git_url":"https://example.com/` + name + `.git","added_at":"2025-01-01T00:00:00Z"}`
 	}
-	if !found {
-		t.Errorf("Expected town-root to need migration, rigs: %v", readiness.Rigs)
+	rigs += "}"
+	content := `{"version":1,"rigs":` + rigs + `}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestRigBackendStatusCheck_AllDolt(t *testing.T) {
-	// Create temp directory structure
-	tmpDir := t.TempDir()
+func TestGetServerAddr(t *testing.T) {
+	check := NewDoltServerReachableCheck()
 
-	// Create .beads directory with Dolt metadata + dolt dir
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	metadata := `{"backend": "dolt"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create mayor directory with empty rigs.json
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"version": 1, "rigs": {}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewRigBackendStatusCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK, got %v: %s", result.Status, result.Message)
-	}
-}
-
-func TestRigBackendStatusCheck_SQLiteDetected(t *testing.T) {
-	// Create temp directory structure
-	tmpDir := t.TempDir()
-
-	// Create .beads directory with SQLite metadata + beads.db
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	metadata := `{"backend": "sqlite"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte(""), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create mayor directory with empty rigs.json
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"version": 1, "rigs": {}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewRigBackendStatusCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusError {
-		t.Errorf("Expected StatusError, got %v: %s", result.Status, result.Message)
-	}
-
-	// Should mention never-migrated in details
-	foundNeverMigrated := false
-	for _, detail := range result.Details {
-		if contains(detail, "never migrated") {
-			foundNeverMigrated = true
-			break
-		}
-	}
-	if !foundNeverMigrated {
-		t.Errorf("Expected 'never migrated' in details, got: %v", result.Details)
-	}
-}
-
-func TestRigBackendStatusCheck_PartiallyMigrated(t *testing.T) {
-	// Create temp directory structure: sqlite metadata but dolt-data exists
-	tmpDir := t.TempDir()
-
-	// Create .beads directory with sqlite metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	metadata := `{"backend": "sqlite"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte(""), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// BUT also create .dolt-data/hq/.dolt (centralized dolt data exists)
-	doltDataDir := filepath.Join(tmpDir, ".dolt-data", "hq", ".dolt")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create mayor directory with empty rigs.json
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"version": 1, "rigs": {}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewRigBackendStatusCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusError {
-		t.Errorf("Expected StatusError, got %v: %s", result.Status, result.Message)
-	}
-
-	// Should mention partially-migrated
-	foundPartial := false
-	for _, detail := range result.Details {
-		if contains(detail, "partially migrated") {
-			foundPartial = true
-			break
-		}
-	}
-	if !foundPartial {
-		t.Errorf("Expected 'partially migrated' in details, got: %v", result.Details)
-	}
-}
-
-func TestRigBackendStatusCheck_JSONLOnly(t *testing.T) {
-	// Rig with JSONL but no database backend at all
-	tmpDir := t.TempDir()
-
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Only JSONL, no metadata, no beads.db, no dolt
-	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(`{"id":"test"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create mayor directory with empty rigs.json
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"version": 1, "rigs": {}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewRigBackendStatusCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusError {
-		t.Errorf("Expected StatusError, got %v: %s", result.Status, result.Message)
-	}
-
-	// Should classify as never-migrated with JSONL evidence
-	foundJSONL := false
-	for _, detail := range result.Details {
-		if contains(detail, "JSONL only") {
-			foundJSONL = true
-			break
-		}
-	}
-	if !foundJSONL {
-		t.Errorf("Expected 'JSONL only' in details, got: %v", result.Details)
-	}
-}
-
-func TestRigBackendStatusCheck_NoBeadsSkipped(t *testing.T) {
-	// Rig registered but no beads dir at all — should not be reported as issue
-	tmpDir := t.TempDir()
-
-	// No .beads at town root
-
-	// Create mayor directory with one rig
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"version": 1, "rigs": {"myrig": {"git_url": "git@example.com:test.git"}}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// myrig directory exists but no beads
-	if err := os.MkdirAll(filepath.Join(tmpDir, "myrig", "mayor", "rig"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewRigBackendStatusCheck()
-	result := check.Run(ctx)
-
-	// No beads = nothing to migrate, should be OK (0 fully migrated though)
-	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK for no-beads rigs, got %v: %s (details: %v)", result.Status, result.Message, result.Details)
-	}
-}
-
-func TestRigBackendStatusCheck_MixedStates(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Town root: fully migrated (dolt metadata + dolt dir)
-	townBeads := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(filepath.Join(townBeads, "dolt"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(townBeads, "metadata.json"), []byte(`{"backend":"dolt"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create mayor directory with two rigs
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"version": 1, "rigs": {"rigA": {}, "rigB": {}}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// rigA: fully migrated
-	rigABeads := filepath.Join(tmpDir, "rigA", "mayor", "rig", ".beads")
-	if err := os.MkdirAll(filepath.Join(rigABeads, "dolt"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rigABeads, "metadata.json"), []byte(`{"backend":"dolt"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// rigB: never migrated (sqlite)
-	rigBBeads := filepath.Join(tmpDir, "rigB", "mayor", "rig", ".beads")
-	if err := os.MkdirAll(rigBBeads, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rigBBeads, "metadata.json"), []byte(`{"backend":"sqlite"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rigBBeads, "beads.db"), []byte(""), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewRigBackendStatusCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusError {
-		t.Errorf("Expected StatusError for mixed states, got %v: %s", result.Status, result.Message)
-	}
-
-	// Message should mention both counts
-	if !contains(result.Message, "1 never-migrated") {
-		t.Errorf("Expected '1 never-migrated' in message, got: %s", result.Message)
-	}
-	if !contains(result.Message, "2 fully-migrated") {
-		t.Errorf("Expected '2 fully-migrated' in message, got: %s", result.Message)
-	}
-}
-
-func TestClassifyRigMigration_States(t *testing.T) {
 	tests := []struct {
-		name          string
-		setup         func(tmpDir string)
-		expectedState MigrationState
-		needsMigrate  bool
+		name     string
+		host     string
+		port     int
+		wantAddr string
+		wantOK   bool
 	}{
 		{
-			name: "fully migrated with dolt dir",
-			setup: func(dir string) {
-				beads := filepath.Join(dir, ".beads")
-				os.MkdirAll(filepath.Join(beads, "dolt"), 0755)
-				os.WriteFile(filepath.Join(beads, "metadata.json"), []byte(`{"backend":"dolt"}`), 0644)
-			},
-			expectedState: StateFullyMigrated,
-			needsMigrate:  false,
+			name:     "defaults to 127.0.0.1:3307",
+			wantAddr: "127.0.0.1:3307",
+			wantOK:   true,
 		},
 		{
-			name: "fully migrated with dolt-data",
-			setup: func(dir string) {
-				beads := filepath.Join(dir, ".beads")
-				os.MkdirAll(beads, 0755)
-				os.WriteFile(filepath.Join(beads, "metadata.json"), []byte(`{"backend":"dolt"}`), 0644)
-				os.MkdirAll(filepath.Join(dir, ".dolt-data", "testrig", ".dolt"), 0755)
-			},
-			expectedState: StateFullyMigrated,
-			needsMigrate:  false,
+			name:     "explicit IPv4 host and port",
+			host:     "10.0.0.5",
+			port:     3308,
+			wantAddr: "10.0.0.5:3308",
+			wantOK:   true,
 		},
 		{
-			name: "never migrated sqlite",
-			setup: func(dir string) {
-				beads := filepath.Join(dir, ".beads")
-				os.MkdirAll(beads, 0755)
-				os.WriteFile(filepath.Join(beads, "metadata.json"), []byte(`{"backend":"sqlite"}`), 0644)
-				os.WriteFile(filepath.Join(beads, "beads.db"), []byte(""), 0644)
-			},
-			expectedState: StateNeverMigrated,
-			needsMigrate:  true,
+			name:     "IPv6 host gets bracketed",
+			host:     "::1",
+			wantAddr: "[::1]:3307",
+			wantOK:   true,
 		},
 		{
-			name: "never migrated JSONL only",
-			setup: func(dir string) {
-				beads := filepath.Join(dir, ".beads")
-				os.MkdirAll(beads, 0755)
-				os.WriteFile(filepath.Join(beads, "issues.jsonl"), []byte("{}"), 0644)
-			},
-			expectedState: StateNeverMigrated,
-			needsMigrate:  true,
+			name:     "IPv6 host with explicit port",
+			host:     "::1",
+			port:     3309,
+			wantAddr: "[::1]:3309",
+			wantOK:   true,
 		},
 		{
-			name: "partially migrated - dolt data exists but metadata says sqlite",
-			setup: func(dir string) {
-				beads := filepath.Join(dir, ".beads")
-				os.MkdirAll(beads, 0755)
-				os.WriteFile(filepath.Join(beads, "metadata.json"), []byte(`{"backend":"sqlite"}`), 0644)
-				os.WriteFile(filepath.Join(beads, "beads.db"), []byte(""), 0644)
-				os.MkdirAll(filepath.Join(dir, ".dolt-data", "testrig", ".dolt"), 0755)
-			},
-			expectedState: StatePartiallyMigrated,
-			needsMigrate:  true,
-		},
-		{
-			name: "partially migrated - metadata says dolt but no dolt db",
-			setup: func(dir string) {
-				beads := filepath.Join(dir, ".beads")
-				os.MkdirAll(beads, 0755)
-				os.WriteFile(filepath.Join(beads, "metadata.json"), []byte(`{"backend":"dolt"}`), 0644)
-			},
-			expectedState: StatePartiallyMigrated,
-			needsMigrate:  true,
-		},
-		{
-			name: "partially migrated - dolt dir in beads but metadata says sqlite",
-			setup: func(dir string) {
-				beads := filepath.Join(dir, ".beads")
-				os.MkdirAll(filepath.Join(beads, "dolt"), 0755)
-				os.WriteFile(filepath.Join(beads, "metadata.json"), []byte(`{"backend":"sqlite"}`), 0644)
-			},
-			expectedState: StatePartiallyMigrated,
-			needsMigrate:  true,
-		},
-		{
-			name: "no beads dir",
-			setup: func(dir string) {
-				// Don't create .beads
-			},
-			expectedState: StateNoBeads,
-			needsMigrate:  false,
+			name:     "explicit host with default port",
+			host:     "dolt.example.com",
+			wantAddr: "dolt.example.com:3307",
+			wantOK:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			tt.setup(tmpDir)
+			beadsDir := filepath.Join(t.TempDir(), ".beads")
+			setupServerMetadata(t, beadsDir, tt.host, tt.port)
 
-			result := classifyRigMigration("testrig", "testrig", filepath.Join(tmpDir, ".beads"), tmpDir)
-
-			if result.State != tt.expectedState {
-				t.Errorf("Expected state %s, got %s", tt.expectedState, result.State)
+			addr, ok := check.getServerAddr(beadsDir)
+			if ok != tt.wantOK {
+				t.Fatalf("getServerAddr() ok = %v, want %v", ok, tt.wantOK)
 			}
-			if result.NeedsMigration != tt.needsMigrate {
-				t.Errorf("Expected NeedsMigration=%v, got %v", tt.needsMigrate, result.NeedsMigration)
+			if addr != tt.wantAddr {
+				t.Errorf("getServerAddr() = %q, want %q", addr, tt.wantAddr)
 			}
 		})
 	}
 }
 
-func TestDoltMetadataCheck_NoDoltData(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// No .dolt-data directory = dolt not in use
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+func TestGetServerAddr_NotServerMode(t *testing.T) {
+	check := NewDoltServerReachableCheck()
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
+	meta := map[string]interface{}{
+		"backend":   "dolt",
+		"dolt_mode": "local",
+	}
+	data, _ := json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltMetadataCheck()
+	_, ok := check.getServerAddr(beadsDir)
+	if ok {
+		t.Error("getServerAddr() returned ok=true for local mode, want false")
+	}
+}
+
+func TestGetServerAddr_NoMetadata(t *testing.T) {
+	check := NewDoltServerReachableCheck()
+	_, ok := check.getServerAddr(filepath.Join(t.TempDir(), "nonexistent"))
+	if ok {
+		t.Error("getServerAddr() returned ok=true for missing metadata, want false")
+	}
+}
+
+func TestDoltOrphanedDatabaseCheck_NoOrphans(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupDoltDB(t, townRoot, "hq")
+	setupDoltDB(t, townRoot, "gastown")
+
+	setupRigsJSON(t, townRoot, []string{"gastown"})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+	setupRigMetadata(t, townRoot, "gastown", "gastown")
+
+	check := NewDoltOrphanedDatabaseCheck()
+	ctx := &CheckContext{TownRoot: townRoot}
+
 	result := check.Run(ctx)
-
 	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK when no dolt data dir, got %v: %s", result.Status, result.Message)
+		t.Errorf("expected StatusOK, got %v: %s", result.Status, result.Message)
 	}
 }
 
-func TestDoltMetadataCheck_MissingMetadata(t *testing.T) {
-	tmpDir := t.TempDir()
+func TestDoltOrphanedDatabaseCheck_DetectsOrphans(t *testing.T) {
+	townRoot := t.TempDir()
 
-	// Create .dolt-data/hq (dolt is in use)
-	doltDataDir := filepath.Join(tmpDir, ".dolt-data", "hq", ".dolt")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
-		t.Fatal(err)
-	}
+	setupDoltDB(t, townRoot, "hq")
+	setupDoltDB(t, townRoot, "wyvern")
+	setupDoltDB(t, townRoot, "beads_wy") // orphan
 
-	// Create .beads directory WITHOUT dolt metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"),
-		[]byte(`{"database": "beads.db"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
+	setupRigsJSON(t, townRoot, []string{"wyvern"})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+	setupRigMetadata(t, townRoot, "wyvern", "wyvern")
 
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
-		t.Fatal(err)
-	}
+	check := NewDoltOrphanedDatabaseCheck()
+	ctx := &CheckContext{TownRoot: townRoot}
 
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltMetadataCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusWarning {
-		t.Errorf("Expected StatusWarning for missing dolt metadata, got %v: %s", result.Status, result.Message)
-	}
-}
-
-func TestDoltMetadataCheck_CorrectMetadata(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create .dolt-data/hq
-	doltDataDir := filepath.Join(tmpDir, ".dolt-data", "hq", ".dolt")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create .beads directory WITH correct dolt metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	metadata := `{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltMetadataCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK for correct dolt metadata, got %v: %s", result.Status, result.Message)
-	}
-}
-
-func TestDoltMetadataCheck_FixWritesMetadata(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create .dolt-data/hq
-	doltDataDir := filepath.Join(tmpDir, ".dolt-data", "hq", ".dolt")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create .beads directory without dolt metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"),
-		[]byte(`{"database": "beads.db"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltMetadataCheck()
-
-	// Run to detect missing metadata
 	result := check.Run(ctx)
 	if result.Status != StatusWarning {
-		t.Fatalf("Expected StatusWarning, got %v", result.Status)
+		t.Fatalf("expected StatusWarning, got %v: %s", result.Status, result.Message)
+	}
+	if result.Message != "1 orphaned database(s) in .dolt-data/" {
+		t.Errorf("unexpected message: %s", result.Message)
+	}
+	if len(result.Details) != 1 {
+		t.Fatalf("expected 1 detail, got %d", len(result.Details))
+	}
+	if result.FixHint == "" {
+		t.Error("expected a fix hint")
+	}
+}
+
+func TestDoltOrphanedDatabaseCheck_Fix(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupDoltDB(t, townRoot, "hq")
+	setupDoltDB(t, townRoot, "orphan1")
+	setupDoltDB(t, townRoot, "orphan2")
+
+	setupRigsJSON(t, townRoot, []string{})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+
+	check := NewDoltOrphanedDatabaseCheck()
+	ctx := &CheckContext{TownRoot: townRoot}
+
+	// Run to populate orphan names
+	result := check.Run(ctx)
+	if result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning, got %v: %s", result.Status, result.Message)
+	}
+	if len(check.orphanNames) != 2 {
+		t.Fatalf("expected 2 cached orphan names, got %d", len(check.orphanNames))
 	}
 
-	// Fix should write dolt metadata
+	// Fix should remove the orphans
 	if err := check.Fix(ctx); err != nil {
-		t.Fatalf("Fix failed: %v", err)
+		t.Fatalf("Fix: %v", err)
 	}
 
-	// Run again to verify fix
-	result = check.Run(ctx)
-	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK after fix, got %v: %s", result.Status, result.Message)
-	}
-}
-
-func TestDoltMetadataCheck_RigWithMayorBeads(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create .dolt-data/myrig
-	doltDataDir := filepath.Join(tmpDir, ".dolt-data", "myrig", ".dolt")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create rig with mayor/rig/.beads (no metadata)
-	mayorBeads := filepath.Join(tmpDir, "myrig", "mayor", "rig", ".beads")
-	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Rigs.json lists "myrig"
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigsJSON := `{"rigs":{"myrig":{}}}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltMetadataCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusWarning {
-		t.Errorf("Expected StatusWarning for rig without metadata, got %v: %s", result.Status, result.Message)
-	}
-
-	// Fix it
-	if err := check.Fix(ctx); err != nil {
-		t.Fatalf("Fix failed: %v", err)
-	}
-
-	// Verify fix wrote to mayor/rig/.beads/metadata.json
-	result = check.Run(ctx)
-	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK after fix, got %v: %s", result.Status, result.Message)
-	}
-}
-
-func TestBdSupportsDolt(t *testing.T) {
-	check := &MigrationReadinessCheck{}
-
-	tests := []struct {
-		version string
-		want    bool
-	}{
-		{"bd version 0.49.3 (commit)", true},
-		{"bd version 0.40.0 (commit)", true},
-		{"bd version 0.39.9 (commit)", false},
-		{"bd version 0.30.0 (commit)", false},
-		{"bd version 1.0.0 (commit)", true},
-		{"invalid", false},
-	}
-
-	for _, tt := range tests {
-		got := check.bdSupportsDolt(tt.version)
-		if got != tt.want {
-			t.Errorf("bdSupportsDolt(%q) = %v, want %v", tt.version, got, tt.want)
+	// Verify orphans are gone
+	for _, name := range []string{"orphan1", "orphan2"} {
+		path := filepath.Join(townRoot, ".dolt-data", name)
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed after Fix", name)
 		}
 	}
-}
 
-// NewUnmigratedRigCheck backward compatibility test
-func TestNewUnmigratedRigCheck_BackwardCompat(t *testing.T) {
-	check := NewUnmigratedRigCheck()
-	if check.Name() != "rig-backend-status" {
-		t.Errorf("Expected name 'rig-backend-status', got %q", check.Name())
+	// Verify referenced database still exists
+	hqPath := filepath.Join(townRoot, ".dolt-data", "hq")
+	if _, err := os.Stat(hqPath); err != nil {
+		t.Errorf("expected hq database to survive Fix, but got error: %v", err)
 	}
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchSubstring(s, substr)
-}
+func TestDoltOrphanedDatabaseCheck_NoDoltData(t *testing.T) {
+	townRoot := t.TempDir()
 
-func searchSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
+	check := NewDoltOrphanedDatabaseCheck()
+	ctx := &CheckContext{TownRoot: townRoot}
 
-// Tests for DoltServerReachableCheck
-
-func TestDoltServerReachableCheck_NoServerModeRigs(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create beads directory WITHOUT server mode metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	// Metadata says sqlite, not server
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"),
-		[]byte(`{"backend":"sqlite"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltServerReachableCheck()
 	result := check.Run(ctx)
-
 	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK when no server mode rigs, got %v: %s", result.Status, result.Message)
+		t.Errorf("expected StatusOK for missing .dolt-data/, got %v: %s", result.Status, result.Message)
 	}
 }
 
-func TestDoltServerReachableCheck_ServerModeButUnreachable(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create beads directory WITH server mode metadata
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	metadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltServerReachableCheck()
-	result := check.Run(ctx)
-
-	// Server isn't running in test, so should detect split-brain risk
-	// Note: this test may pass as OK if a real Dolt server happens to be
-	// running on port 3307 during the test. That's acceptable.
-	if result.Status == StatusOK {
-		t.Skip("Dolt server is actually running on port 3307, cannot test unreachable case")
-	}
-	if result.Status != StatusError {
-		t.Errorf("Expected StatusError for server-mode-but-unreachable, got %v: %s", result.Status, result.Message)
-	}
-	if !contains(result.Message, "SPLIT-BRAIN") {
-		t.Errorf("Expected SPLIT-BRAIN in message, got: %s", result.Message)
+func TestDoltOrphanedDatabaseCheck_CanFix(t *testing.T) {
+	check := NewDoltOrphanedDatabaseCheck()
+	if !check.CanFix() {
+		t.Error("expected CanFix to return true")
 	}
 }
 
-func TestDoltServerReachableCheck_MultipleRigsServerMode(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create town-level beads with server mode
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	metadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create a rig with server mode
-	rigBeadsDir := filepath.Join(tmpDir, "myrig", "mayor", "rig", ".beads")
-	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	rigMetadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"myrig"}`
-	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(rigMetadata), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"),
-		[]byte(`{"rigs":{"myrig":{}}}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltServerReachableCheck()
-	result := check.Run(ctx)
-
-	if result.Status == StatusOK {
-		t.Skip("Dolt server is actually running on port 3307, cannot test unreachable case")
-	}
-	if result.Status != StatusError {
-		t.Errorf("Expected StatusError, got %v: %s", result.Status, result.Message)
-	}
-	// Should mention both rigs
-	if !contains(result.Details[0], "hq") || !contains(result.Details[0], "myrig") {
-		t.Errorf("Expected details to mention both hq and myrig, got: %s", result.Details[0])
+func TestDoltOrphanedDatabaseCheck_Name(t *testing.T) {
+	check := NewDoltOrphanedDatabaseCheck()
+	if check.Name() != "dolt-orphaned-databases" {
+		t.Errorf("expected name 'dolt-orphaned-databases', got %q", check.Name())
 	}
 }
 
-func TestDoltServerReachableCheck_NoMetadataNoRigs(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Empty workspace — no beads, no rigs
-	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := &CheckContext{TownRoot: tmpDir}
-	check := NewDoltServerReachableCheck()
-	result := check.Run(ctx)
-
-	if result.Status != StatusOK {
-		t.Errorf("Expected StatusOK for empty workspace, got %v: %s", result.Status, result.Message)
-	}
-}

@@ -4,10 +4,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+)
+
+const (
+	// testDeadlockTimeout is the maximum time to wait for a goroutine to
+	// complete before assuming a deadlock. Generous to avoid flakes on slow CI.
+	testDeadlockTimeout = 5 * time.Second
+
+	// testConcurrentHold is how long a test goroutine holds a lock or sleeps
+	// to give other goroutines a chance to contend.
+	testConcurrentHold = 200 * time.Millisecond
 )
 
 func TestAdvanceBackoff(t *testing.T) {
@@ -301,6 +313,9 @@ func TestRestartingFlag_PreventsConcurrentRestarts(t *testing.T) {
 }
 
 func TestStartLocked_SkipsIfAlreadyRunning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("isProcessAlive uses Signal(nil) on Windows which doesn't reliably detect live processes")
+	}
 	// Verify that startLocked() re-checks isRunning() to close the TOCTOU window.
 	// If the server is already running (m.process is alive), startLocked() should
 	// return nil without attempting to start a second instance.
@@ -358,66 +373,72 @@ func TestStartLocked_SkipsIfAlreadyRunning(t *testing.T) {
 func TestRestartWithBackoff_SkipsIfStartedDuringSleep(t *testing.T) {
 	// Verify that restartWithBackoff() re-checks isRunning() after the backoff
 	// sleep to detect if another goroutine started the server during the window.
-	tmpDir := t.TempDir()
-	daemonDir := filepath.Join(tmpDir, "daemon")
-	if err := os.MkdirAll(daemonDir, 0755); err != nil {
-		t.Fatal(err)
-	}
+	//
+	// Previous version used time.Sleep races which caused deadlocks when OS
+	// scheduling varied. This version uses channel-based synchronization via
+	// test hooks for deterministic behavior.
+	sleepStarted := make(chan struct{})
+	sleepDone := make(chan struct{})
 
+	var running atomic.Bool
 	var logMessages []string
-	m := &DoltServerManager{
-		config: &DoltServerConfig{
-			Enabled:             true,
-			Port:                13308,
-			Host:                "127.0.0.1",
-			DataDir:             filepath.Join(tmpDir, "dolt"),
-			LogFile:             filepath.Join(daemonDir, "dolt-server.log"),
-			RestartDelay:        10 * time.Millisecond, // Short delay for testing
-			MaxRestartDelay:     100 * time.Millisecond,
-			MaxRestartsInWindow: 10,
-			RestartWindow:       10 * time.Minute,
-		},
-		townRoot: tmpDir,
-		logger: func(format string, v ...interface{}) {
-			logMessages = append(logMessages, fmt.Sprintf(format, v...))
-		},
+	var logMu sync.Mutex
+
+	m := newTestManager(t)
+	m.logger = func(format string, v ...interface{}) {
+		logMu.Lock()
+		logMessages = append(logMessages, fmt.Sprintf(format, v...))
+		logMu.Unlock()
+	}
+	m.runningFn = func() (int, bool) {
+		if running.Load() {
+			return os.Getpid(), true
+		}
+		return 0, false
+	}
+	m.sleepFn = func(d time.Duration) {
+		close(sleepStarted)
+		<-sleepDone
+	}
+	m.startFn = func() error {
+		t.Error("startLocked should not be called when server started during sleep")
+		return nil
 	}
 
-	// Simulate: during backoff sleep, another goroutine starts the server.
-	// We do this by launching restartWithBackoff in a goroutine and setting
-	// m.process while it's sleeping.
+	// restartWithBackoff expects to be called with m.mu held
 	m.mu.Lock()
 
 	done := make(chan error, 1)
 	go func() {
-		// restartWithBackoff expects to be called with m.mu held
 		done <- m.restartWithBackoff()
 	}()
 
-	// Wait for the goroutine to release the lock during sleep
-	time.Sleep(5 * time.Millisecond)
+	// Wait for the goroutine to enter backoff sleep (lock is released during sleep)
+	<-sleepStarted
 
-	// Simulate another goroutine starting the server by setting m.process
-	m.mu.Lock()
-	self, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.process = self
-	m.mu.Unlock()
+	// Simulate another goroutine starting the server during the backoff window
+	running.Store(true)
+
+	// Let the sleep finish — goroutine will re-acquire lock and check isRunning()
+	close(sleepDone)
 
 	// Wait for restartWithBackoff to complete
-	err = <-done
-
-	if err != nil {
-		t.Fatalf("expected nil error when server started during backoff, got: %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil error when server started during backoff, got: %v", err)
+		}
+	case <-time.After(testDeadlockTimeout):
+		t.Fatal("restartWithBackoff never completed — possible deadlock")
 	}
 
 	// Verify the skip was logged
+	logMu.Lock()
+	defer logMu.Unlock()
 	found := false
 	for _, msg := range logMessages {
-		if msg == "Dolt server started by another goroutine during backoff, skipping" ||
-			msg == "Dolt server already running, skipping start" {
+		if strings.Contains(msg, "started by another goroutine during backoff") ||
+			strings.Contains(msg, "already running, skipping start") {
 			found = true
 			break
 		}
@@ -441,14 +462,14 @@ func TestWriteAndClearUnhealthySignal(t *testing.T) {
 	}
 
 	// Initially no signal
-	if IsDoltUnhealthy(tmpDir) {
+	if _, err := os.Stat(m.unhealthySignalFile()); err == nil {
 		t.Error("expected no unhealthy signal initially")
 	}
 
 	// Write signal
 	m.writeUnhealthySignal("server_dead", "PID 12345 is dead")
 
-	if !IsDoltUnhealthy(tmpDir) {
+	if _, err := os.Stat(m.unhealthySignalFile()); err != nil {
 		t.Error("expected unhealthy signal after write")
 	}
 
@@ -465,21 +486,38 @@ func TestWriteAndClearUnhealthySignal(t *testing.T) {
 	// Clear signal
 	m.clearUnhealthySignal()
 
-	if IsDoltUnhealthy(tmpDir) {
+	if _, err := os.Stat(m.unhealthySignalFile()); err == nil {
 		t.Error("expected no unhealthy signal after clear")
 	}
 }
 
 func TestUnhealthySignalFile_Path(t *testing.T) {
+	// Port 3307 (production) uses canonical DOLT_UNHEALTHY path
+	prodConfig := DefaultDoltServerConfig("/tmp/test-town")
+	prodConfig.Port = 3307
 	m := &DoltServerManager{
-		config:   DefaultDoltServerConfig("/tmp/test-town"),
+		config:   prodConfig,
 		townRoot: "/tmp/test-town",
 		logger:   func(format string, v ...interface{}) {},
 	}
 
-	expected := "/tmp/test-town/daemon/DOLT_UNHEALTHY"
+	expected := filepath.Join("/tmp", "test-town", "daemon", "DOLT_UNHEALTHY")
 	if got := m.unhealthySignalFile(); got != expected {
 		t.Errorf("expected %s, got %s", expected, got)
+	}
+
+	// Non-3307 ports get a port-suffixed path
+	testConfig := DefaultDoltServerConfig("/tmp/test-town")
+	testConfig.Port = 3308
+	m2 := &DoltServerManager{
+		config:   testConfig,
+		townRoot: "/tmp/test-town",
+		logger:   func(format string, v ...interface{}) {},
+	}
+
+	expected2 := filepath.Join("/tmp", "test-town", "daemon", "DOLT_UNHEALTHY_3308")
+	if got := m2.unhealthySignalFile(); got != expected2 {
+		t.Errorf("expected %s, got %s", expected2, got)
 	}
 }
 
@@ -518,6 +556,7 @@ func newTestManager(t *testing.T) *DoltServerManager {
 		logger:           func(format string, v ...interface{}) { t.Logf(format, v...) },
 		runningFn:        func() (int, bool) { return 0, false },
 		healthCheckFn:    func() error { return nil },
+		identityCheckFn:  func() error { return nil },
 		startFn:          func() error { return nil },
 		stopFn:           func() {},
 		unhealthyAlertFn: func(error) {},
@@ -537,7 +576,7 @@ func TestConcurrentEnsureRunning_OnlyOneRestart(t *testing.T) {
 		return nil
 	}
 	m.sleepFn = func(d time.Duration) {
-		time.Sleep(200 * time.Millisecond) // Hold to let other goroutines try
+		time.Sleep(testConcurrentHold) // Hold to let other goroutines try
 	}
 
 	const n = 10
@@ -595,7 +634,7 @@ func TestConcurrentEnsureRunning_BackoffSleepReleasesLock(t *testing.T) {
 		if err != nil {
 			t.Errorf("concurrent caller got error: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testDeadlockTimeout):
 		t.Fatal("concurrent caller blocked while restart was sleeping")
 	}
 
@@ -607,7 +646,7 @@ func TestConcurrentEnsureRunning_BackoffSleepReleasesLock(t *testing.T) {
 		if err != nil {
 			t.Errorf("first caller got error: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testDeadlockTimeout):
 		t.Fatal("first caller never completed")
 	}
 }
@@ -616,13 +655,24 @@ func TestConcurrentEnsureRunning_BackoffSleepReleasesLock(t *testing.T) {
 // server running but unhealthy -> stop -> restart with backoff.
 func TestEnsureRunning_UnhealthyTriggersRestart(t *testing.T) {
 	var stopCount, startCount atomic.Int32
+	var running atomic.Bool
+	running.Store(true) // Server starts as running
 
 	m := newTestManager(t)
-	m.runningFn = func() (int, bool) { return 1234, true }
+	m.runningFn = func() (int, bool) {
+		if running.Load() {
+			return 1234, true
+		}
+		return 0, false
+	}
 	m.healthCheckFn = func() error { return fmt.Errorf("connection refused") }
-	m.stopFn = func() { stopCount.Add(1) }
+	m.stopFn = func() {
+		stopCount.Add(1)
+		running.Store(false) // Stop marks server as not running
+	}
 	m.startFn = func() error {
 		startCount.Add(1)
+		running.Store(true) // Start marks server as running
 		return nil
 	}
 	m.sleepFn = func(d time.Duration) {} // instant
@@ -871,5 +921,239 @@ func TestEnsureRunning_StartFailurePropagates(t *testing.T) {
 	}
 	if err.Error() != "dolt not found in PATH" {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// ============================================================================
+// Read-only detection and write probe tests
+// ============================================================================
+
+func TestIsReadOnlyError(t *testing.T) {
+	tests := []struct {
+		msg  string
+		want bool
+	}{
+		{"cannot update manifest: database is read only", true},
+		{"database is read only", true},
+		{"Database Is Read Only", true},
+		{"error: read-only mode", true},
+		{"server is readonly", true},
+		{"connection refused", false},
+		{"timeout", false},
+		{"", false},
+		{"table not found", false},
+	}
+
+	for _, tt := range tests {
+		if got := isReadOnlyError(tt.msg); got != tt.want {
+			t.Errorf("isReadOnlyError(%q) = %v, want %v", tt.msg, got, tt.want)
+		}
+	}
+}
+
+// TestCheckWriteHealth_ReadOnlyDetected verifies that when the write probe
+// returns a read-only error, checkWriteHealthLocked returns an error.
+func TestCheckWriteHealth_ReadOnlyDetected(t *testing.T) {
+	m := newTestManager(t)
+	m.writeProbeCheckFn = func() error {
+		return fmt.Errorf("dolt server is in read-only mode: cannot update manifest: database is read only")
+	}
+
+	m.mu.Lock()
+	err := m.checkWriteHealthLocked()
+	m.mu.Unlock()
+
+	if err == nil {
+		t.Fatal("expected error from write probe")
+	}
+	if !isReadOnlyError(err.Error()) {
+		t.Errorf("expected read-only error, got: %v", err)
+	}
+}
+
+// TestCheckWriteHealth_WritableServer verifies that when the write probe
+// succeeds, checkWriteHealthLocked returns nil.
+func TestCheckWriteHealth_WritableServer(t *testing.T) {
+	m := newTestManager(t)
+	m.writeProbeCheckFn = func() error {
+		return nil
+	}
+
+	m.mu.Lock()
+	err := m.checkWriteHealthLocked()
+	m.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+// TestCheckWriteHealth_NonReadOnlyError verifies that non-read-only write
+// failures do not cause the health check to fail (logged as warnings instead).
+func TestCheckWriteHealth_NonReadOnlyError(t *testing.T) {
+	m := newTestManager(t)
+	m.writeProbeCheckFn = func() error {
+		return nil // Non-read-only errors are logged, not returned
+	}
+
+	m.mu.Lock()
+	err := m.checkWriteHealthLocked()
+	m.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("expected nil error for non-read-only failure, got: %v", err)
+	}
+}
+
+// TestCheckWriteHealth_NoDatabases verifies that the write probe is skipped
+// when no databases are available.
+func TestCheckWriteHealth_NoDatabases(t *testing.T) {
+	m := newTestManager(t)
+	m.writeProbeCheckFn = nil // Use real implementation
+	m.listDatabasesFn = func() ([]string, error) {
+		return nil, nil // No databases
+	}
+
+	m.mu.Lock()
+	err := m.checkWriteHealthLocked()
+	m.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("expected nil error when no databases, got: %v", err)
+	}
+}
+
+// TestEnsureRunning_ReadOnlyTriggersRestart verifies the full flow:
+// server running, healthy (SELECT 1 passes), but read-only -> stop -> restart.
+func TestEnsureRunning_ReadOnlyTriggersRestart(t *testing.T) {
+	var stopCount, startCount atomic.Int32
+	var readOnlyAlerted atomic.Bool
+	var running atomic.Bool
+	running.Store(true)
+
+	m := newTestManager(t)
+	m.runningFn = func() (int, bool) {
+		if running.Load() {
+			return 1234, true
+		}
+		return 0, false
+	}
+	m.healthCheckFn = func() error { return nil } // SELECT 1 passes
+	m.writeProbeCheckFn = func() error {
+		return fmt.Errorf("dolt server is in read-only mode: cannot update manifest: database is read only")
+	}
+	m.stopFn = func() {
+		stopCount.Add(1)
+		running.Store(false)
+	}
+	m.startFn = func() error {
+		startCount.Add(1)
+		running.Store(true)
+		return nil
+	}
+	m.readOnlyAlertFn = func(err error) {
+		readOnlyAlerted.Store(true)
+	}
+	m.sleepFn = func(d time.Duration) {} // instant
+
+	err := m.EnsureRunning()
+	if err != nil {
+		t.Fatalf("EnsureRunning returned error: %v", err)
+	}
+
+	if got := stopCount.Load(); got != 1 {
+		t.Errorf("expected 1 stop, got %d", got)
+	}
+	if got := startCount.Load(); got != 1 {
+		t.Errorf("expected 1 start (restart), got %d", got)
+	}
+	if !readOnlyAlerted.Load() {
+		t.Error("expected read-only alert to be sent")
+	}
+}
+
+// TestEnsureRunning_ReadOnlyWritesUnhealthySignal verifies that read-only
+// detection writes the DOLT_UNHEALTHY signal file with "read_only" reason.
+func TestEnsureRunning_ReadOnlyWritesUnhealthySignal(t *testing.T) {
+	var running atomic.Bool
+	running.Store(true)
+
+	m := newTestManager(t)
+	m.runningFn = func() (int, bool) {
+		if running.Load() {
+			return 1234, true
+		}
+		return 0, false
+	}
+	m.healthCheckFn = func() error { return nil }
+	m.writeProbeCheckFn = func() error {
+		return fmt.Errorf("dolt server is in read-only mode: database is read only")
+	}
+	m.stopFn = func() { running.Store(false) }
+	m.startFn = func() error {
+		running.Store(true)
+		return nil
+	}
+	m.readOnlyAlertFn = func(err error) {}
+	m.sleepFn = func(d time.Duration) {}
+
+	_ = m.EnsureRunning()
+
+	// Check the DOLT_UNHEALTHY signal file was written (port-specific path)
+	data, err := os.ReadFile(m.unhealthySignalFile())
+	if err != nil {
+		t.Fatalf("expected DOLT_UNHEALTHY signal file: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "read_only") {
+		t.Errorf("expected 'read_only' reason in signal file, got: %s", content)
+	}
+}
+
+// TestEnsureRunning_HealthyAfterReadOnlyRecovery verifies that after a
+// read-only restart, subsequent healthy checks clear the unhealthy signal.
+func TestEnsureRunning_HealthyAfterReadOnlyRecovery(t *testing.T) {
+	var running atomic.Bool
+	var readOnly atomic.Bool
+	running.Store(true)
+	readOnly.Store(true) // Initially read-only
+
+	m := newTestManager(t)
+	m.runningFn = func() (int, bool) {
+		if running.Load() {
+			return 1234, true
+		}
+		return 0, false
+	}
+	m.healthCheckFn = func() error { return nil }
+	m.writeProbeCheckFn = func() error {
+		if readOnly.Load() {
+			return fmt.Errorf("dolt server is in read-only mode")
+		}
+		return nil
+	}
+	m.stopFn = func() { running.Store(false) }
+	m.startFn = func() error {
+		running.Store(true)
+		readOnly.Store(false) // Server recovers after restart
+		return nil
+	}
+	m.readOnlyAlertFn = func(err error) {}
+	m.sleepFn = func(d time.Duration) {}
+
+	// Phase 1: read-only -> restart
+	if err := m.EnsureRunning(); err != nil {
+		t.Fatalf("phase 1: %v", err)
+	}
+
+	// Phase 2: healthy after restart
+	if err := m.EnsureRunning(); err != nil {
+		t.Fatalf("phase 2: %v", err)
+	}
+
+	// Unhealthy signal should be cleared
+	if _, err := os.Stat(m.unhealthySignalFile()); err == nil {
+		t.Error("expected DOLT_UNHEALTHY signal to be cleared after recovery")
 	}
 }

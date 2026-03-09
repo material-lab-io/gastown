@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -16,9 +15,8 @@ var (
 	doctorVerbose         bool
 	doctorRig             string
 	doctorRestartSessions bool
+	doctorNoStart         bool
 	doctorSlow            string
-	doctorMigrate         bool
-	doctorJSON            bool
 )
 
 var doctorCmd = &cobra.Command{
@@ -44,26 +42,37 @@ Town root protection:
 
 Infrastructure checks:
   - stale-binary             Check if gt binary is up to date with repo
+  - beads-binary             Check that beads (bd) is installed and meets minimum version
   - daemon                   Check if daemon is running (fixable)
-  - repo-fingerprint         Check database has valid repo fingerprint (fixable)
   - boot-health              Check Boot watchdog health (vet mode)
+  - town-beads-config        Verify town .beads/config.yaml exists (fixable)
 
 Cleanup checks (fixable):
   - orphan-sessions          Detect orphaned tmux sessions
   - orphan-processes         Detect orphaned Claude processes
+  - session-name-format      Detect sessions with outdated naming format (fixable)
   - wisp-gc                  Detect and clean abandoned wisps (>1h)
+  - misclassified-wisps      Detect issues that should be wisps (purges to wisps table, fixable)
+  - jsonl-bloat              Detect stale/bloated issues.jsonl vs live database
+  - stale-beads-redirect     Detect stale files in .beads directories with redirects
 
 Clone divergence checks:
-  - persistent-role-branches Detect crew/witness/refinery not on main
+  - persistent-role-branches Detect witness/refinery not on main (excludes crew)
   - clone-divergence         Detect clones significantly behind origin/main
+  - default-branch-all-rigs  Verify default_branch exists on remote for all rigs
+  - worktree-gitdir-valid    Verify worktree .git files reference existing paths (fixable)
 
 Crew workspace checks:
   - crew-state               Validate crew worker state.json files (fixable)
   - crew-worktrees           Detect stale cross-rig worktrees (fixable)
 
+Migration checks (fixable):
+  - sparse-checkout          Detect legacy sparse checkout across all rigs
+
 Rig checks (with --rig flag):
   - rig-is-git-repo          Verify rig is a valid git repository
   - git-exclude-configured   Check .git/info/exclude has Gas Town dirs (fixable)
+  - bare-repo-exists         Verify .repo.git exists when worktrees depend on it (fixable)
   - witness-exists           Verify witness/ structure exists (fixable)
   - refinery-exists          Verify refinery/ structure exists (fixable)
   - mayor-clone-exists       Verify mayor/rig/ clone exists (fixable)
@@ -75,26 +84,34 @@ Routing checks (fixable):
   - prefix-mismatch          Detect rigs.json vs routes.jsonl prefix mismatches (fixable)
   - database-prefix          Detect database vs routes.jsonl prefix mismatches (fixable)
 
+Lifecycle checks (fixable):
+  - lifecycle-defaults          Ensure daemon.json has all lifecycle patrol entries (fixable)
+
+Migration checks:
+  - town-claude-md           Check town-root CLAUDE.md matches embedded version (fixable)
+
 Session hook checks:
   - session-hooks            Check settings.json use session-start.sh
   - claude-settings          Check Claude settings.json match templates (fixable)
+  - deprecated-merge-queue-keys  Detect stale deprecated keys in merge_queue config (fixable)
+  - stale-task-dispatch      Detect stale task-dispatch guard in settings.json (fixable)
+
+Dolt checks:
+  - dolt-binary              Check that dolt is installed and meets minimum version
+  - dolt-metadata            Check dolt metadata tables exist
+  - dolt-server-reachable    Check dolt sql-server is reachable
+  - dolt-orphaned-databases  Detect orphaned dolt databases
 
 Patrol checks:
   - patrol-molecules-exist   Verify patrol molecules exist
   - patrol-hooks-wired       Verify daemon triggers patrols
   - patrol-not-stuck         Detect stale wisps (>1h)
   - patrol-plugins-accessible Verify plugin directories
-  - patrol-roles-have-prompts Verify role prompts exist
-
-Migration readiness checks (--migrate):
-  - migration-readiness      Overall migration readiness status
-  - rig-backend-status       Classify rig backends (never/partially/fully migrated)
 
 Use --fix to attempt automatic fixes for issues that support it.
+Use --no-start with --fix to suppress starting the daemon and agents.
 Use --rig to check a specific rig instead of the entire workspace.
-Use --slow to highlight slow checks (default threshold: 1s, e.g. --slow=500ms).
-Use --migrate to check migration readiness (SQLite to Dolt).
-Use --json with --migrate for machine-parseable output.`,
+Use --slow to highlight slow checks (default threshold: 1s, e.g. --slow=500ms).`,
 	RunE: runDoctor,
 }
 
@@ -103,9 +120,8 @@ func init() {
 	doctorCmd.Flags().BoolVarP(&doctorVerbose, "verbose", "v", false, "Show detailed output")
 	doctorCmd.Flags().StringVar(&doctorRig, "rig", "", "Check specific rig only")
 	doctorCmd.Flags().BoolVar(&doctorRestartSessions, "restart-sessions", false, "Restart patrol sessions when fixing stale settings (use with --fix)")
+	doctorCmd.Flags().BoolVar(&doctorNoStart, "no-start", false, "Suppress starting daemon/agents during --fix")
 	doctorCmd.Flags().StringVar(&doctorSlow, "slow", "", "Highlight slow checks (optional threshold, default 1s)")
-	doctorCmd.Flags().BoolVar(&doctorMigrate, "migrate", false, "Check migration readiness (SQLite to Dolt)")
-	doctorCmd.Flags().BoolVar(&doctorJSON, "json", false, "Output as JSON (use with --migrate)")
 	// Allow --slow without a value (uses default 1s)
 	doctorCmd.Flags().Lookup("slow").NoOptDefVal = "1s"
 	rootCmd.AddCommand(doctorCmd)
@@ -124,11 +140,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		RigName:         doctorRig,
 		Verbose:         doctorVerbose,
 		RestartSessions: doctorRestartSessions,
-	}
-
-	// Handle --migrate mode (focused migration readiness check)
-	if doctorMigrate {
-		return runMigrationCheck(ctx)
+		NoStart:         doctorNoStart,
 	}
 
 	// Create doctor and register checks
@@ -139,17 +151,31 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	d.Register(doctor.NewGlobalStateCheck())
 
-	// Register built-in checks
+	// Infrastructure prerequisites — these must pass before any check that
+	// shells out to bd/dolt or queries the database. Order matters:
+	// 1. gt binary freshness
+	// 2. bd binary exists
+	// 3. dolt binary exists
+	// 4. Dolt server is reachable (everything downstream depends on this)
 	d.Register(doctor.NewStaleBinaryCheck())
-	d.Register(doctor.NewSqlite3Check())
+	d.Register(doctor.NewBeadsBinaryCheck())
+	d.Register(doctor.NewDoltBinaryCheck())
+	d.Register(doctor.NewDoltServerReachableCheck())
+
 	d.Register(doctor.NewTownGitCheck())
 	d.Register(doctor.NewTownRootBranchCheck())
 	d.Register(doctor.NewPreCheckoutHookCheck())
+	// Claude settings must be fixed BEFORE the daemon starts, so sessions
+	// launched by the daemon find correct settings files. If daemon runs first,
+	// its EnsureSettingsForRole sees stale files → returns early → sessions
+	// start with missing PATH exports. See gt-99u.
+	d.Register(doctor.NewClaudeSettingsCheck())
 	d.Register(doctor.NewDaemonCheck())
-	d.Register(doctor.NewRepoFingerprintCheck())
+	d.Register(doctor.NewTmuxGlobalEnvCheck())
 	d.Register(doctor.NewBootHealthCheck())
-	d.Register(doctor.NewBeadsDatabaseCheck())
+	d.Register(doctor.NewTownBeadsConfigCheck())
 	d.Register(doctor.NewCustomTypesCheck())
+	d.Register(doctor.NewCustomStatusesCheck())
 	d.Register(doctor.NewRoleLabelCheck())
 	d.Register(doctor.NewFormulaCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
@@ -159,15 +185,18 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewRoutesCheck())
 	d.Register(doctor.NewRigRoutesJSONLCheck())
 	d.Register(doctor.NewRoutingModeCheck())
+	d.Register(doctor.NewMalformedSessionNameCheck())
 	d.Register(doctor.NewOrphanSessionCheck())
 	d.Register(doctor.NewZombieSessionCheck())
 	d.Register(doctor.NewOrphanProcessCheck())
 	d.Register(doctor.NewWispGCCheck())
 	d.Register(doctor.NewCheckMisclassifiedWisps())
+	d.Register(doctor.NewCheckJSONLBloat())
+	d.Register(doctor.NewStaleBeadsRedirectCheck())
+	d.Register(doctor.NewBeadsRedirectTargetCheck())
 	d.Register(doctor.NewBranchCheck())
-	d.Register(doctor.NewBeadsSyncOrphanCheck())
-	d.Register(doctor.NewBeadsSyncWorktreeCheck())
 	d.Register(doctor.NewCloneDivergenceCheck())
+	d.Register(doctor.NewDefaultBranchAllRigsCheck())
 	d.Register(doctor.NewIdentityCollisionCheck())
 	d.Register(doctor.NewLinkedPaneCheck())
 	d.Register(doctor.NewThemeCheck())
@@ -179,7 +208,6 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewPatrolHooksWiredCheck())
 	d.Register(doctor.NewPatrolNotStuckCheck())
 	d.Register(doctor.NewPatrolPluginsAccessibleCheck())
-	d.Register(doctor.NewPatrolRolesHavePromptsCheck())
 	d.Register(doctor.NewAgentBeadsCheck())
 	d.Register(doctor.NewStaleAgentBeadsCheck())
 	d.Register(doctor.NewRigBeadsCheck())
@@ -192,10 +220,19 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewSessionHookCheck())
 	d.Register(doctor.NewRuntimeGitignoreCheck())
 	d.Register(doctor.NewLegacyGastownCheck())
-	d.Register(doctor.NewClaudeSettingsCheck())
+	// NOTE: ClaudeSettingsCheck moved before DaemonCheck (gt-99u race fix)
+	d.Register(doctor.NewDeprecatedMergeQueueKeysCheck())
+	d.Register(doctor.NewLandWorktreeGitignoreCheck())
+	d.Register(doctor.NewHooksPathAllRigsCheck())
+
+	// Sparse checkout migration (runs across all rigs, not just --rig mode)
+	d.Register(doctor.NewSparseCheckoutCheck())
 
 	// Priming subsystem check
 	d.Register(doctor.NewPrimingCheck())
+
+	// Town-root CLAUDE.md version check (migration check for behavioral norms)
+	d.Register(doctor.NewTownCLAUDEmdCheck())
 
 	// Crew workspace checks
 	d.Register(doctor.NewCrewStateCheck())
@@ -204,6 +241,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	// Lifecycle hygiene checks
 	d.Register(doctor.NewLifecycleHygieneCheck())
+	d.Register(doctor.NewLifecycleDefaultsCheck())
 
 	// Hook attachment checks
 	d.Register(doctor.NewHookAttachmentValidCheck())
@@ -211,13 +249,17 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewOrphanedAttachmentsCheck())
 
 	// Hooks sync check
+	d.Register(doctor.NewStaleTaskDispatchCheck())
 	d.Register(doctor.NewHooksSyncCheck())
 
-	// Migration readiness checks
-	d.Register(doctor.NewMigrationReadinessCheck())
-	d.Register(doctor.NewRigBackendStatusCheck())
+	// Dolt data health checks (binary + server reachability moved to top as prerequisites)
 	d.Register(doctor.NewDoltMetadataCheck())
-	d.Register(doctor.NewDoltServerReachableCheck())
+	d.Register(doctor.NewDoltOrphanedDatabaseCheck())
+	d.Register(doctor.NewUnregisteredBeadsDirsCheck())
+	d.Register(doctor.NewNullAssigneeCheck())
+
+	// Worktree gitdir validity (runs across all rigs, or specific rig with --rig)
+	d.Register(doctor.NewWorktreeGitdirCheck())
 
 	// Rig-specific checks (only when --rig is specified)
 	if doctorRig != "" {
@@ -251,75 +293,5 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("doctor found %d error(s)", report.Summary.Errors)
 	}
 
-	return nil
-}
-
-// runMigrationCheck runs focused migration readiness checks.
-// With --json, outputs machine-parseable JSON for Claude to consume.
-func runMigrationCheck(ctx *doctor.CheckContext) error {
-	check := doctor.NewMigrationReadinessCheck()
-	result := check.Run(ctx)
-	readiness := check.Readiness()
-
-	if doctorJSON {
-		// Machine-parseable JSON output
-		output, err := json.MarshalIndent(readiness, "", "  ")
-		if err != nil {
-			return fmt.Errorf("failed to marshal JSON: %w", err)
-		}
-		fmt.Println(string(output))
-		return nil
-	}
-
-	// Human-readable output
-	fmt.Println()
-	fmt.Println("Migration Readiness Check")
-	fmt.Println("=========================")
-	fmt.Println()
-
-	// Version info
-	fmt.Printf("Versions:\n")
-	fmt.Printf("  gt: %s\n", readiness.Version.GT)
-	fmt.Printf("  bd: %s\n", readiness.Version.BD)
-	if readiness.Version.BDSupportsDolt {
-		fmt.Printf("  Dolt support: YES\n")
-	} else {
-		fmt.Printf("  Dolt support: NO (requires bd 0.40.0+)\n")
-	}
-	fmt.Println()
-
-	// Per-rig status
-	fmt.Printf("Rig Status:\n")
-	for _, rig := range readiness.Rigs {
-		status := "OK"
-		if rig.NeedsMigration {
-			status = "NEEDS MIGRATION"
-		}
-		gitStatus := ""
-		if !rig.GitClean {
-			gitStatus = " (uncommitted changes)"
-		}
-		fmt.Printf("  %s: %s (backend: %s)%s\n", rig.Name, status, rig.Backend, gitStatus)
-	}
-	fmt.Println()
-
-	// Overall verdict
-	if readiness.Ready {
-		fmt.Println("Ready to migrate: YES")
-		fmt.Println("All rigs are already on Dolt backend.")
-	} else {
-		fmt.Println("Ready to migrate: NO")
-		fmt.Println()
-		fmt.Println("Blockers:")
-		for i, blocker := range readiness.Blockers {
-			fmt.Printf("  %d. %s\n", i+1, blocker)
-		}
-		fmt.Println()
-		fmt.Println("Fix: Run 'bd migrate' in each rig that needs migration.")
-	}
-
-	if result.Status != doctor.StatusOK {
-		return fmt.Errorf("migration readiness check failed")
-	}
 	return nil
 }

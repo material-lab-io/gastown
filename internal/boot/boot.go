@@ -26,7 +26,6 @@ const StatusFileName = ".boot-status.json"
 
 // Status represents Boot's execution status.
 type Status struct {
-	Running     bool      `json:"running"`
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
 	LastAction  string    `json:"last_action,omitempty"` // start/wake/nudge/nothing
@@ -168,8 +167,7 @@ func (b *Boot) Spawn(agentOverride string) error {
 
 // spawnTmux spawns Boot in a tmux session.
 func (b *Boot) spawnTmux(agentOverride string) error {
-	// Kill any stale session first.
-	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
+	// Kill any stale session first (Boot is ephemeral).
 	if b.IsSessionAlive() {
 		_ = b.tmux.KillSessionWithProcesses(session.BootSessionName())
 	}
@@ -179,39 +177,21 @@ func (b *Boot) spawnTmux(agentOverride string) error {
 		return fmt.Errorf("ensuring boot dir: %w", err)
 	}
 
-	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
-		Recipient: "boot",
-		Sender:    "daemon",
-		Topic:     "triage",
-	}, "Run `" + cli.Name() + " boot triage` now.")
-
-	var startCmd string
-	if agentOverride != "" {
-		var err error
-		startCmd, err = config.BuildAgentStartupCommandWithAgentOverride("boot", "", b.townRoot, "", initialPrompt, agentOverride)
-		if err != nil {
-			return fmt.Errorf("building startup command with agent override: %w", err)
-		}
-	} else {
-		startCmd = config.BuildAgentStartupCommand("boot", "", b.townRoot, "", initialPrompt)
-	}
-
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	if err := b.tmux.NewSessionWithCommand(session.BootSessionName(), b.bootDir, startCmd); err != nil {
-		return fmt.Errorf("creating boot session: %w", err)
-	}
-
-	// Set environment using centralized AgentEnv for consistency
-	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "boot",
-		TownRoot: b.townRoot,
+	// Use unified session lifecycle for config → settings → command → create → env.
+	_, err := session.StartSession(b.tmux, session.SessionConfig{
+		SessionID: session.BootSessionName(),
+		WorkDir:   b.bootDir,
+		Role:      "boot",
+		TownRoot:  b.townRoot,
+		Beacon: session.BeaconConfig{
+			Recipient: "boot",
+			Sender:    "daemon",
+			Topic:     "triage",
+		},
+		Instructions:  "Run `" + cli.Name() + " boot triage` now.",
+		AgentOverride: agentOverride,
 	})
-	for k, v := range envVars {
-		_ = b.tmux.SetEnvironment(session.BootSessionName(), k, v)
-	}
-
-	return nil
+	return err
 }
 
 // spawnDegraded spawns Boot in degraded mode (no tmux).

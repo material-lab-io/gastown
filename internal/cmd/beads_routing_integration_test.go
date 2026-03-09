@@ -7,20 +7,48 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
 
+// routingTestCounter generates unique prefixes for each routing test to isolate
+// Dolt databases on the shared server.
+var routingTestCounter atomic.Int32
+
 // setupRoutingTestTown creates a minimal Gas Town with multiple rigs for testing routing.
+// Uses fixed prefixes (hq, gt, tr) — suitable for tests that don't create Dolt databases.
 // Returns townRoot.
 func setupRoutingTestTown(t *testing.T) string {
 	t.Helper()
+	return setupRoutingTestTownWithPrefixes(t, "hq", "gt", "tr")
+}
 
-	townRoot := t.TempDir()
+// setupRoutingTestTownWithPrefixes creates a minimal Gas Town with multiple rigs,
+// using the given prefixes for routes and beads config. Use unique prefixes when
+// tests create Dolt databases to avoid collisions.
+// Returns townRoot.
+func setupRoutingTestTownWithPrefixes(t *testing.T, hqPrefix, gtPrefix, trPrefix string) string {
+	t.Helper()
+
+	townRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	// Create mayor/town.json so FindTownRoot() can detect this as a Gas Town root
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
 
 	// Create town-level .beads directory
 	townBeadsDir := filepath.Join(townRoot, ".beads")
@@ -30,9 +58,9 @@ func setupRoutingTestTown(t *testing.T) string {
 
 	// Create routes.jsonl with multiple rigs
 	routes := []beads.Route{
-		{Prefix: "hq-", Path: "."},                      // Town-level beads
-		{Prefix: "gt-", Path: "gastown/mayor/rig"},      // Gastown rig
-		{Prefix: "tr-", Path: "testrig/mayor/rig"},      // Test rig
+		{Prefix: hqPrefix + "-", Path: "."},                 // Town-level beads
+		{Prefix: gtPrefix + "-", Path: "gastown/mayor/rig"}, // Gastown rig
+		{Prefix: trPrefix + "-", Path: "testrig/mayor/rig"}, // Test rig
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -49,7 +77,7 @@ func setupRoutingTestTown(t *testing.T) string {
 	if err := os.MkdirAll(gasBeadsDir, 0755); err != nil {
 		t.Fatalf("mkdir gastown .beads: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(gasBeadsDir, "config.yaml"), []byte("prefix: gt\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(gasBeadsDir, "config.yaml"), []byte("prefix: "+gtPrefix+"\n"), 0644); err != nil {
 		t.Fatalf("write gastown config: %v", err)
 	}
 
@@ -64,7 +92,7 @@ func setupRoutingTestTown(t *testing.T) string {
 	if err := os.MkdirAll(testBeadsDir, 0755); err != nil {
 		t.Fatalf("mkdir testrig .beads: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(testBeadsDir, "config.yaml"), []byte("prefix: tr\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(testBeadsDir, "config.yaml"), []byte("prefix: "+trPrefix+"\n"), 0644); err != nil {
 		t.Fatalf("write testrig config: %v", err)
 	}
 
@@ -107,15 +135,19 @@ func setupRoutingTestTown(t *testing.T) string {
 func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
 	t.Helper()
 
-	cmd := exec.Command("bd", "--no-daemon", "init", "--quiet", "--prefix", prefix)
+	args := []string{"init", "--quiet", "--prefix", prefix}
+	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
+	// instead of defaulting to port 3307.
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		args = append(args, "--server-port", p)
+	}
+	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, output)
 	}
 
-	// Create empty issues.jsonl to prevent bd auto-export from corrupting routes.jsonl.
-	// Without this, bd create writes issue data to routes.jsonl (the first .jsonl file
-	// it finds), corrupting the routing configuration. This mirrors what gt install does.
+	// Create issues.jsonl — bd expects this file for git-tracked issue data.
 	issuesPath := filepath.Join(dir, ".beads", "issues.jsonl")
 	if err := os.WriteFile(issuesPath, []byte(""), 0644); err != nil {
 		t.Fatalf("create issues.jsonl in %s: %v", dir, err)
@@ -125,7 +157,7 @@ func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
 func createTestIssue(t *testing.T, dir, title string) *beads.Issue {
 	t.Helper()
 
-	args := []string{"--no-daemon", "create", "--json", "--title", title, "--type", "task",
+	args := []string{"create", "--json", "--title", title, "--type", "task",
 		"--description", "Integration test issue"}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
@@ -163,15 +195,21 @@ func TestBeadsRoutingFromTownRoot(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
 		t.Skip("bd not installed, skipping routing test")
 	}
+	requireDoltServer(t)
 
-	townRoot := setupRoutingTestTown(t)
+	n := routingTestCounter.Add(1)
+	hqP := fmt.Sprintf("rhq%d", n)
+	gtP := fmt.Sprintf("rgt%d", n)
+	trP := fmt.Sprintf("rtr%d", n)
 
-	initBeadsDBWithPrefix(t, townRoot, "hq")
+	townRoot := setupRoutingTestTownWithPrefixes(t, hqP, gtP, trP)
+
+	initBeadsDBWithPrefix(t, townRoot, hqP)
 
 	gastownRigPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
 	testrigRigPath := filepath.Join(townRoot, "testrig", "mayor", "rig")
-	initBeadsDBWithPrefix(t, gastownRigPath, "gt")
-	initBeadsDBWithPrefix(t, testrigRigPath, "tr")
+	initBeadsDBWithPrefix(t, gastownRigPath, gtP)
+	initBeadsDBWithPrefix(t, testrigRigPath, trP)
 
 	townIssue := createTestIssue(t, townRoot, "Town-level routing test")
 	gastownIssue := createTestIssue(t, gastownRigPath, "Gastown routing test")
@@ -312,12 +350,16 @@ func TestBeadsListFromPolecatDirectory(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
 		t.Skip("bd not installed, skipping test")
 	}
+	requireDoltServer(t)
 
-	townRoot := setupRoutingTestTown(t)
+	n := routingTestCounter.Add(1)
+	gtP := fmt.Sprintf("rgt%d", n)
+
+	townRoot := setupRoutingTestTownWithPrefixes(t, "hq", gtP, "tr")
 	polecatDir := filepath.Join(townRoot, "gastown", "polecats", "rictus")
 
 	rigPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
-	initBeadsDBWithPrefix(t, rigPath, "gt")
+	initBeadsDBWithPrefix(t, rigPath, gtP)
 
 	issue := createTestIssue(t, rigPath, "Polecat list redirect test")
 
@@ -340,12 +382,16 @@ func TestBeadsListFromCrewDirectory(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
 		t.Skip("bd not installed, skipping test")
 	}
+	requireDoltServer(t)
 
-	townRoot := setupRoutingTestTown(t)
+	n := routingTestCounter.Add(1)
+	gtP := fmt.Sprintf("rgt%d", n)
+
+	townRoot := setupRoutingTestTownWithPrefixes(t, "hq", gtP, "tr")
 	crewDir := filepath.Join(townRoot, "gastown", "crew", "max")
 
 	rigPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
-	initBeadsDBWithPrefix(t, rigPath, "gt")
+	initBeadsDBWithPrefix(t, rigPath, gtP)
 
 	issue := createTestIssue(t, rigPath, "Crew list redirect test")
 

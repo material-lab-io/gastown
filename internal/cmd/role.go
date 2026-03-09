@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -53,7 +54,12 @@ If both are available and disagree, a warning is shown.`,
 var roleShowCmd = &cobra.Command{
 	Use:   "show",
 	Short: "Show current role",
-	RunE:  runRoleShow,
+	Long: `Show the current agent role, its detection source, and associated metadata.
+
+Displays the role name, whether it was detected from the GT_ROLE environment
+variable or the current working directory, and the rig/worker identity if
+applicable. Warns if the two detection methods disagree.`,
+	RunE: runRoleShow,
 }
 
 var roleHomeCmd = &cobra.Command{
@@ -83,7 +89,12 @@ This is useful for debugging role detection issues.`,
 var roleListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all known roles",
-	RunE:  runRoleList,
+	Long: `List all known Gas Town agent roles and their descriptions.
+
+Roles include mayor, deacon, witness, refinery, polecat, and crew.
+Each role has a specific scope and responsibilities within the
+Gas Town multi-agent architecture.`,
+	RunE: runRoleList,
 }
 
 var roleEnvCmd = &cobra.Command{
@@ -107,7 +118,7 @@ var roleDefCmd = &cobra.Command{
 
 Role configuration is layered:
   1. Built-in defaults (embedded in binary)
-  2. Town-level overrides (~/.gt/roles/<role>.toml)
+  2. Town-level overrides (<town>/roles/<role>.toml)
   3. Rig-level overrides (<rig>/roles/<role>.toml)
 
 Examples:
@@ -198,7 +209,7 @@ func GetRoleWithContext(cwd, townRoot string) (RoleInfo, error) {
 		// If env is incomplete (missing rig/polecat for roles that need them),
 		// fill gaps from cwd detection and mark as incomplete
 		needsRig := parsedRole == RoleWitness || parsedRole == RoleRefinery || parsedRole == RolePolecat || parsedRole == RoleCrew
-		needsPolecat := parsedRole == RolePolecat || parsedRole == RoleCrew
+		needsPolecat := parsedRole == RolePolecat || parsedRole == RoleCrew || parsedRole == RoleDog
 
 		if needsRig && info.Rig == "" && cwdCtx.Rig != "" {
 			info.Rig = cwdCtx.Rig
@@ -227,16 +238,122 @@ func GetRoleWithContext(cwd, townRoot string) (RoleInfo, error) {
 	return info, nil
 }
 
+// detectRole detects the agent role from the current working directory path.
+// This is the cwd-based fallback used by GetRoleWithContext when GT_ROLE is not set.
+func detectRole(cwd, townRoot string) RoleInfo {
+	ctx := RoleInfo{
+		Role:     RoleUnknown,
+		TownRoot: townRoot,
+		WorkDir:  cwd,
+		Source:   "cwd",
+	}
+
+	// Get relative path from town root
+	relPath, err := filepath.Rel(townRoot, cwd)
+	if err != nil {
+		return ctx
+	}
+
+	// Normalize and split path
+	relPath = filepath.ToSlash(relPath)
+	parts := strings.Split(relPath, "/")
+
+	// Town root is a neutral location — don't infer any role from it.
+	// The mayor's actual home is mayor/ (matched below).
+	if relPath == "." || relPath == "" {
+		return ctx
+	}
+
+	// Check for mayor role: mayor/ or mayor/rig/
+	if len(parts) >= 1 && parts[0] == "mayor" {
+		ctx.Role = RoleMayor
+		return ctx
+	}
+
+	// Check for boot role: deacon/dogs/boot/
+	// Must check before deacon since boot is under deacon directory
+	if len(parts) >= 3 && parts[0] == "deacon" && parts[1] == "dogs" && parts[2] == "boot" {
+		ctx.Role = RoleBoot
+		return ctx
+	}
+
+	// Check for dog role: deacon/dogs/<name>/
+	// Must check before deacon since dogs are under deacon directory
+	if len(parts) >= 3 && parts[0] == "deacon" && parts[1] == "dogs" {
+		ctx.Role = RoleDog
+		ctx.Polecat = parts[2] // dog name stored in Polecat field
+		return ctx
+	}
+
+	// Check for deacon role: deacon/
+	if len(parts) >= 1 && parts[0] == "deacon" {
+		ctx.Role = RoleDeacon
+		return ctx
+	}
+
+	// At this point, first part should be a rig name
+	if len(parts) < 1 {
+		return ctx
+	}
+	rigName := parts[0]
+	ctx.Rig = rigName
+
+	// Check for mayor: <rig>/mayor/ or <rig>/mayor/rig/
+	if len(parts) >= 2 && parts[1] == "mayor" {
+		ctx.Role = RoleMayor
+		return ctx
+	}
+
+	// Check for witness: <rig>/witness/rig/
+	if len(parts) >= 2 && parts[1] == "witness" {
+		ctx.Role = RoleWitness
+		return ctx
+	}
+
+	// Check for refinery: <rig>/refinery/rig/
+	if len(parts) >= 2 && parts[1] == "refinery" {
+		ctx.Role = RoleRefinery
+		return ctx
+	}
+
+	// Check for polecat: <rig>/polecats/<name>/
+	if len(parts) >= 3 && parts[1] == "polecats" {
+		ctx.Role = RolePolecat
+		ctx.Polecat = parts[2]
+		return ctx
+	}
+
+	// Check for crew: <rig>/crew/<name>/
+	if len(parts) >= 3 && parts[1] == "crew" {
+		ctx.Role = RoleCrew
+		ctx.Polecat = parts[2] // Use Polecat field for crew member name
+		return ctx
+	}
+
+	// Default: could be rig root - treat as unknown
+	return ctx
+}
+
 // parseRoleString parses a role string like "mayor", "gastown/witness", or "gastown/polecats/alpha".
 func parseRoleString(s string) (Role, string, string) {
 	s = strings.TrimSpace(s)
 
+	// Normalize consecutive slashes (e.g. "gamestore//refinery" → "gamestore/refinery")
+	for strings.Contains(s, "//") {
+		s = strings.ReplaceAll(s, "//", "/")
+	}
+	s = strings.TrimSuffix(s, "/")
+
 	// Simple roles
 	switch s {
-	case "mayor":
+	case constants.RoleMayor:
 		return RoleMayor, "", ""
-	case "deacon":
+	case constants.RoleDeacon:
 		return RoleDeacon, "", ""
+	case "boot":
+		return RoleBoot, "", ""
+	case "dog":
+		return RoleDog, "", ""
 	}
 
 	// Compound roles: rig/role or rig/polecats/name or rig/crew/name
@@ -249,16 +366,22 @@ func parseRoleString(s string) (Role, string, string) {
 	rig := parts[0]
 
 	switch parts[1] {
-	case "witness":
+	case "boot":
+		// Handle compound "deacon/boot" format from GT_ROLE env var
+		if rig == "deacon" && len(parts) == 2 {
+			return RoleBoot, "", ""
+		}
+		return Role(s), "", ""
+	case constants.RoleWitness:
 		return RoleWitness, rig, ""
-	case "refinery":
+	case constants.RoleRefinery:
 		return RoleRefinery, rig, ""
 	case "polecats":
 		if len(parts) >= 3 {
 			return RolePolecat, rig, parts[2]
 		}
 		return RolePolecat, rig, ""
-	case "crew":
+	case constants.RoleCrew:
 		if len(parts) >= 3 {
 			return RoleCrew, rig, parts[2]
 		}
@@ -272,6 +395,7 @@ func parseRoleString(s string) (Role, string, string) {
 // ActorString returns the actor identity string for beads attribution.
 // Format matches beads created_by convention:
 //   - Simple roles: "mayor", "deacon"
+//   - Dog roles: "deacon-boot" (hyphenated, matching BD_ACTOR)
 //   - Rig-specific: "gastown/witness", "gastown/refinery"
 //   - Workers: "gastown/crew/max", "gastown/polecats/Toast"
 func (info RoleInfo) ActorString() string {
@@ -300,6 +424,8 @@ func (info RoleInfo) ActorString() string {
 			return fmt.Sprintf("%s/crew/%s", info.Rig, info.Polecat)
 		}
 		return "crew"
+	case RoleBoot:
+		return "deacon-boot"
 	default:
 		return string(info.Role)
 	}
@@ -332,6 +458,13 @@ func getRoleHome(role Role, rig, polecat, townRoot string) string {
 			return ""
 		}
 		return filepath.Join(townRoot, rig, "crew", polecat)
+	case RoleBoot:
+		return filepath.Join(townRoot, "deacon", "dogs", "boot")
+	case RoleDog:
+		if polecat == "" {
+			return ""
+		}
+		return filepath.Join(townRoot, "deacon", "dogs", polecat)
 	default:
 		return ""
 	}
@@ -476,7 +609,7 @@ func runRoleList(cmd *cobra.Command, args []string) error {
 		{RoleDeacon, "Background supervisor daemon"},
 		{RoleWitness, "Per-rig polecat lifecycle manager"},
 		{RoleRefinery, "Per-rig merge queue processor"},
-		{RolePolecat, "Ephemeral worker with own worktree"},
+		{RolePolecat, "Worker with persistent identity, ephemeral sessions"},
 		{RoleCrew, "Persistent worker with own worktree"},
 	}
 
@@ -530,7 +663,6 @@ func runRoleEnv(cmd *cobra.Command, args []string) error {
 		AgentName: info.Polecat,
 		TownRoot:  townRoot,
 	})
-	envVars[EnvGTRole] = string(info.Role)
 	envVars[EnvGTRoleHome] = home
 
 	// Output in sorted order for consistent output
@@ -613,6 +745,9 @@ func runRoleDef(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  consecutive_failures = %d\n", def.Health.ConsecutiveFailures)
 	fmt.Printf("  kill_cooldown        = %q\n", def.Health.KillCooldown.String())
 	fmt.Printf("  stuck_threshold      = %q\n", def.Health.StuckThreshold.String())
+	if def.Health.HungSessionThreshold.Duration != 0 {
+		fmt.Printf("  hung_session_threshold = %q\n", def.Health.HungSessionThreshold.String())
+	}
 	fmt.Println()
 
 	// Prompts

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/style"
 )
 
 // Delegation represents a work delegation relationship between work units.
@@ -77,7 +79,7 @@ func (b *Beads) AddDelegation(d *Delegation) error {
 	// Also add a dependency so child blocks parent (work must complete before parent can close)
 	if err := b.AddDependency(d.Parent, d.Child); err != nil {
 		// Log but don't fail - the delegation is still recorded
-		fmt.Printf("Warning: could not add blocking dependency for delegation: %v\n", err)
+		style.PrintWarning("could not add blocking dependency for delegation: %v", err)
 	}
 
 	return nil
@@ -94,7 +96,7 @@ func (b *Beads) RemoveDelegation(parent, child string) error {
 	// Also remove the blocking dependency
 	if err := b.RemoveDependency(parent, child); err != nil {
 		// Log but don't fail
-		fmt.Printf("Warning: could not remove blocking dependency: %v\n", err)
+		style.PrintWarning("could not remove blocking dependency: %v", err)
 	}
 
 	return nil
@@ -140,14 +142,24 @@ func (b *Beads) ListDelegationsFrom(parent string) ([]*Delegation, error) {
 		return nil, fmt.Errorf("listing issues: %w", err)
 	}
 
+	// Read delegation slots directly instead of calling GetDelegation per issue,
+	// which would redundantly call Show on each issue (already listed above).
 	var delegations []*Delegation
 	for _, issue := range issues {
-		d, err := b.GetDelegation(issue.ID)
+		out, err := b.run("slot", "get", issue.ID, "delegated_from")
 		if err != nil {
-			continue // Skip issues with errors
+			continue // No delegation slot or error — skip
 		}
-		if d != nil && d.Parent == parent {
-			delegations = append(delegations, d)
+		slotValue := strings.TrimSpace(string(out))
+		if slotValue == "" || slotValue == "null" {
+			continue
+		}
+		var d Delegation
+		if err := json.Unmarshal([]byte(slotValue), &d); err != nil {
+			continue
+		}
+		if d.Parent == parent {
+			delegations = append(delegations, &d)
 		}
 	}
 

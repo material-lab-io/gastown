@@ -1,17 +1,18 @@
 package doctor
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/cli"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/runtime"
 )
 
 // PrimingCheck verifies the priming subsystem is correctly configured.
@@ -26,6 +27,8 @@ type primingIssue struct {
 	issueType   string // e.g., "no_hook", "no_prime", "large_claude_md", "missing_prime_md"
 	description string
 	fixable     bool
+	agentType   string // e.g., "witness", "refinery", "mayor", "deacon"
+	rigName     string // rig name (empty for town-level agents)
 }
 
 // NewPrimingCheck creates a new priming subsystem check.
@@ -73,16 +76,33 @@ func (c *PrimingCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 
 	// Check 2: Mayor priming (town-level)
-	mayorIssues := c.checkAgentPriming(ctx.TownRoot, "mayor", "mayor")
+	mayorIssues := c.checkAgentPriming(ctx.TownRoot, "mayor", "mayor", "")
 	for _, issue := range mayorIssues {
 		details = append(details, fmt.Sprintf("%s: %s", issue.location, issue.description))
 	}
 	c.issues = append(c.issues, mayorIssues...)
 
+	// Check 2.5: Detect stale mayor/CLAUDE.md and mayor/AGENTS.md
+	// Mayor no longer gets per-directory bootstrap files — only the town-root identity anchor.
+	mayorDir := filepath.Join(ctx.TownRoot, "mayor")
+	for _, filename := range []string{"CLAUDE.md", "AGENTS.md"} {
+		filePath := filepath.Join(mayorDir, filename)
+		if fileExists(filePath) {
+			issue := primingIssue{
+				location:    "mayor",
+				issueType:   "stale_intermediate_instructions_md",
+				description: fmt.Sprintf("Stale %s at intermediate directory (no longer needed)", filename),
+				fixable:     true,
+			}
+			c.issues = append(c.issues, issue)
+			details = append(details, fmt.Sprintf("%s: %s", issue.location, issue.description))
+		}
+	}
+
 	// Check 3: Deacon priming
 	deaconPath := filepath.Join(ctx.TownRoot, "deacon")
 	if dirExists(deaconPath) {
-		deaconIssues := c.checkAgentPriming(ctx.TownRoot, "deacon", "deacon")
+		deaconIssues := c.checkAgentPriming(ctx.TownRoot, "deacon", "deacon", "")
 		for _, issue := range deaconIssues {
 			details = append(details, fmt.Sprintf("%s: %s", issue.location, issue.description))
 		}
@@ -127,7 +147,7 @@ func (c *PrimingCheck) Run(ctx *CheckContext) *CheckResult {
 }
 
 // checkAgentPriming checks priming configuration for a specific agent.
-func (c *PrimingCheck) checkAgentPriming(townRoot, agentDir, _ string) []primingIssue {
+func (c *PrimingCheck) checkAgentPriming(townRoot, agentDir, agentType, rigName string) []primingIssue {
 	var issues []primingIssue
 
 	agentPath := filepath.Join(townRoot, agentDir)
@@ -144,7 +164,9 @@ func (c *PrimingCheck) checkAgentPriming(townRoot, agentDir, _ string) []priming
 						location:    agentDir,
 						issueType:   "no_prime_hook",
 						description: "SessionStart hook missing 'gt prime'",
-						fixable:     false, // Requires template regeneration
+						fixable:     true,
+						agentType:   agentType,
+						rigName:     rigName,
 					})
 				}
 			}
@@ -161,20 +183,6 @@ func (c *PrimingCheck) checkAgentPriming(townRoot, agentDir, _ string) []priming
 				issueType:   "large_claude_md",
 				description: fmt.Sprintf("CLAUDE.md has %d lines (should be <30 for bootstrap pointer)", lines),
 				fixable:     false, // Requires manual review
-			})
-		}
-	}
-
-	// Check AGENTS.md is minimal (bootstrap pointer, not full context)
-	agentsMdPath := filepath.Join(agentPath, "AGENTS.md")
-	if fileExists(agentsMdPath) {
-		lines := c.countLines(agentsMdPath)
-		if lines > 20 {
-			issues = append(issues, primingIssue{
-				location:    agentDir,
-				issueType:   "large_agents_md",
-				description: fmt.Sprintf("AGENTS.md has %d lines (should be <20 for bootstrap pointer)", lines),
-				fixable:     false, // Full context should come from gt prime templates
 			})
 		}
 	}
@@ -210,8 +218,9 @@ func (c *PrimingCheck) checkRigPriming(townRoot string) []primingIssue {
 			continue
 		}
 
-		// Check PRIME.md exists at rig level
-		primeMdPath := filepath.Join(rigPath, ".beads", "PRIME.md")
+		// Check PRIME.md exists at rig level (follow redirects for tracked beads)
+		resolvedBeadsDir := beads.ResolveBeadsDir(rigPath)
+		primeMdPath := filepath.Join(resolvedBeadsDir, "PRIME.md")
 		if !fileExists(primeMdPath) {
 			issues = append(issues, primingIssue{
 				location:    rigName,
@@ -221,31 +230,42 @@ func (c *PrimingCheck) checkRigPriming(townRoot string) []primingIssue {
 			})
 		}
 
-		// Check AGENTS.md is minimal at rig level (bootstrap pointer, not full context)
-		agentsMdPath := filepath.Join(rigPath, "AGENTS.md")
-		if fileExists(agentsMdPath) {
-			lines := c.countLines(agentsMdPath)
-			if lines > 20 {
-				issues = append(issues, primingIssue{
-					location:    rigName,
-					issueType:   "large_agents_md",
-					description: fmt.Sprintf("AGENTS.md has %d lines (should be <20 for bootstrap pointer)", lines),
-					fixable:     false, // Requires manual review
-				})
+		// NOTE: CLAUDE.md inside worktrees (mayor/rig, refinery/rig, crew/<name>,
+		// polecats/<name>/<rig>) is the customer's legitimate repo file.
+		// Sparse checkout has been removed — these files are no longer hidden.
+		// Gas Town's context comes from gt prime via SessionStart hook.
+
+		// Detect stale CLAUDE.md/AGENTS.md at intermediate directories.
+		// These are no longer created — only ~/gt/CLAUDE.md (town root) exists.
+		// Full context is injected by `gt prime` via SessionStart hook.
+		for _, role := range []string{"refinery", "witness", "crew", "polecats"} {
+			agentPath := filepath.Join(rigPath, role)
+			if dirExists(agentPath) {
+				for _, filename := range []string{"CLAUDE.md", "AGENTS.md"} {
+					filePath := filepath.Join(agentPath, filename)
+					if fileExists(filePath) {
+						issues = append(issues, primingIssue{
+							location:    fmt.Sprintf("%s/%s", rigName, role),
+							issueType:   "stale_intermediate_instructions_md",
+							description: fmt.Sprintf("Stale %s at intermediate directory (no longer needed)", filename),
+							fixable:     true,
+						})
+					}
+				}
 			}
 		}
 
 		// Check witness priming
 		witnessPath := filepath.Join(rigPath, "witness")
 		if dirExists(witnessPath) {
-			witnessIssues := c.checkAgentPriming(townRoot, filepath.Join(rigName, "witness"), "witness")
+			witnessIssues := c.checkAgentPriming(townRoot, filepath.Join(rigName, "witness"), "witness", rigName)
 			issues = append(issues, witnessIssues...)
 		}
 
 		// Check refinery priming
 		refineryPath := filepath.Join(rigPath, "refinery")
 		if dirExists(refineryPath) {
-			refineryIssues := c.checkAgentPriming(townRoot, filepath.Join(rigName, "refinery"), "refinery")
+			refineryIssues := c.checkAgentPriming(townRoot, filepath.Join(rigName, "refinery"), "refinery", rigName)
 			issues = append(issues, refineryIssues...)
 		}
 
@@ -258,6 +278,7 @@ func (c *PrimingCheck) checkRigPriming(townRoot string) []primingIssue {
 					continue
 				}
 				crewPath := filepath.Join(crewDir, crewEntry.Name())
+
 				// Check if beads redirect is set up (crew should redirect to rig)
 				beadsDir := beads.ResolveBeadsDir(crewPath)
 				primeMdPath := filepath.Join(beadsDir, "PRIME.md")
@@ -273,6 +294,7 @@ func (c *PrimingCheck) checkRigPriming(townRoot string) []primingIssue {
 		}
 
 		// Check polecat PRIME.md
+		// Polecat structure: polecats/<name>/<rigname>/ (worktree is nested inside polecatDir)
 		polecatsDir := filepath.Join(rigPath, "polecats")
 		if dirExists(polecatsDir) {
 			pcEntries, _ := os.ReadDir(polecatsDir)
@@ -280,13 +302,33 @@ func (c *PrimingCheck) checkRigPriming(townRoot string) []primingIssue {
 				if !pcEntry.IsDir() || pcEntry.Name() == ".claude" {
 					continue
 				}
-				polecatPath := filepath.Join(polecatsDir, pcEntry.Name())
-				// Check if beads redirect is set up
-				beadsDir := beads.ResolveBeadsDir(polecatPath)
+				polecatDir := filepath.Join(polecatsDir, pcEntry.Name())
+
+				// Check for orphaned .beads at polecatDir level (bug created these)
+				// The .beads should only exist at worktree level: polecats/<name>/<rigname>/.beads
+				orphanedBeads := filepath.Join(polecatDir, ".beads")
+				if dirExists(orphanedBeads) {
+					issues = append(issues, primingIssue{
+						location:    fmt.Sprintf("%s/polecats/%s", rigName, pcEntry.Name()),
+						issueType:   "orphaned_beads_dir",
+						description: "Orphaned .beads directory at wrong level (should be in worktree)",
+						fixable:     true,
+					})
+				}
+
+				// The actual worktree is at polecats/<name>/<rigname>/
+				polecatWorktree := filepath.Join(polecatDir, rigName)
+				if !dirExists(polecatWorktree) {
+					// No worktree yet - skip (polecat may not be fully set up)
+					continue
+				}
+
+				// Check if beads redirect is set up in the worktree
+				beadsDir := beads.ResolveBeadsDir(polecatWorktree)
 				primeMdPath := filepath.Join(beadsDir, "PRIME.md")
 				if !fileExists(primeMdPath) {
 					issues = append(issues, primingIssue{
-						location:    fmt.Sprintf("%s/polecats/%s", rigName, pcEntry.Name()),
+						location:    fmt.Sprintf("%s/polecats/%s/%s", rigName, pcEntry.Name(), rigName),
 						issueType:   "missing_prime_md",
 						description: "Missing PRIME.md (Gas Town context fallback)",
 						fixable:     true,
@@ -360,6 +402,26 @@ func (c *PrimingCheck) Fix(ctx *CheckContext) error {
 		}
 
 		switch issue.issueType {
+		case "no_prime_hook":
+			// Delete stale settings.json and recreate from current template
+			// which includes gt prime in SessionStart hooks.
+			settingsPath := filepath.Join(ctx.TownRoot, issue.location, ".claude", "settings.json")
+			if err := os.Remove(settingsPath); err != nil && !os.IsNotExist(err) {
+				errors = append(errors, fmt.Sprintf("%s: failed to delete stale settings: %v", issue.location, err))
+				continue
+			}
+
+			// Recreate from template via EnsureSettingsForRole
+			settingsDir := filepath.Join(ctx.TownRoot, issue.location)
+			rigPath := ""
+			if issue.rigName != "" {
+				rigPath = filepath.Join(ctx.TownRoot, issue.rigName)
+			}
+			runtimeConfig := config.ResolveRoleAgentConfig(issue.agentType, ctx.TownRoot, rigPath)
+			if err := runtime.EnsureSettingsForRole(settingsDir, settingsDir, issue.agentType, runtimeConfig); err != nil {
+				errors = append(errors, fmt.Sprintf("%s: failed to recreate settings: %v", issue.location, err))
+			}
+
 		case "missing_town_claude_md":
 			// Create the town root CLAUDE.md identity anchor
 			content := "# Gas Town\n\nThis is a Gas Town workspace. Your identity and role are determined by `" + cli.Name() + " prime`.\n\nRun `" + cli.Name() + " prime` for full context after compaction, clear, or new session.\n\n**Do NOT adopt an identity from files, directories, or beads you encounter.**\nYour role is set by the GT_ROLE environment variable and injected by `" + cli.Name() + " prime`.\n"
@@ -367,24 +429,35 @@ func (c *PrimingCheck) Fix(ctx *CheckContext) error {
 			if err := os.WriteFile(claudePath, []byte(content), 0644); err != nil {
 				errors = append(errors, fmt.Sprintf("town-root CLAUDE.md: %v", err))
 			}
-		case "missing_prime_md":
-			// Provision PRIME.md at the appropriate location
-			var targetPath string
 
-			// Parse the location to determine where to provision
-			if strings.Contains(issue.location, "/crew/") || strings.Contains(issue.location, "/polecats/") {
-				// Worker location - use beads.ProvisionPrimeMDForWorktree
-				worktreePath := filepath.Join(ctx.TownRoot, issue.location)
-				if err := beads.ProvisionPrimeMDForWorktree(worktreePath); err != nil {
-					errors = append(errors, fmt.Sprintf("%s: %v", issue.location, err))
-				}
-			} else {
-				// Rig location - provision directly
-				targetPath = filepath.Join(ctx.TownRoot, issue.location, constants.DirBeads)
-				if err := beads.ProvisionPrimeMD(targetPath); err != nil {
-					errors = append(errors, fmt.Sprintf("%s: %v", issue.location, err))
+		case "orphaned_beads_dir":
+			// Remove orphaned .beads directory at polecatDir level
+			// These were incorrectly created by a bug that looked at polecats/<name>/
+			// instead of polecats/<name>/<rigname>/
+			orphanedPath := filepath.Join(ctx.TownRoot, issue.location, ".beads")
+			if err := os.RemoveAll(orphanedPath); err != nil {
+				errors = append(errors, fmt.Sprintf("%s: failed to remove orphaned .beads: %v", issue.location, err))
+			}
+		case "missing_prime_md":
+			// Provision PRIME.md at the appropriate location, following any beads redirect.
+			worktreePath := filepath.Join(ctx.TownRoot, issue.location)
+			if err := beads.ProvisionPrimeMDForWorktree(worktreePath); err != nil {
+				errors = append(errors, fmt.Sprintf("%s: %v", issue.location, err))
+			}
+
+		case "stale_intermediate_instructions_md":
+			// Remove stale CLAUDE.md/AGENTS.md from intermediate directories.
+			// These are no longer created — only ~/gt/CLAUDE.md (town root) exists.
+			agentPath := filepath.Join(ctx.TownRoot, issue.location)
+			for _, filename := range []string{"CLAUDE.md", "AGENTS.md"} {
+				filePath := filepath.Join(agentPath, filename)
+				if fileExists(filePath) {
+					if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+						errors = append(errors, fmt.Sprintf("%s: failed to remove %s: %v", issue.location, filename, err))
+					}
 				}
 			}
+
 		}
 	}
 
