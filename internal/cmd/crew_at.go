@@ -178,13 +178,8 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 	}
 
 	if !hasSession {
-		// Create new session
-		if err := t.NewSession(sessionID, worker.ClonePath); err != nil {
-			return fmt.Errorf("creating session: %w", err)
-		}
-
-		// Set environment (non-fatal: session works without these)
-		// Use centralized AgentEnv for consistency across all role startup paths
+		// Build environment vars for the new session.
+		// Use centralized AgentEnv for consistency across all role startup paths.
 		envVars := config.AgentEnv(config.AgentEnvConfig{
 			Role:             "crew",
 			Rig:              r.Name,
@@ -195,29 +190,10 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 			Topic:            "start",
 			SessionName:      sessionID,
 		})
-		for k, v := range envVars {
-			_ = t.SetEnvironment(sessionID, k, v)
-		}
 
-		// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
-		// Note: ConfigureGasTownSession includes cycle bindings
-		theme := getThemeForRig(r.Name)
-		_ = t.ConfigureGasTownSession(sessionID, theme, r.Name, name, "crew")
-
-		// Wait for shell to be ready after session creation
-		if err := t.WaitForShellReady(sessionID, constants.ShellReadyTimeout); err != nil {
-			return fmt.Errorf("waiting for shell: %w", err)
-		}
-
-		// Get pane ID for respawn
-		paneID, err := t.GetPaneID(sessionID)
-		if err != nil {
-			return fmt.Errorf("getting pane ID: %w", err)
-		}
-
-		// Build startup beacon for predecessor discovery via /resume
-		// Use FormatStartupBeacon instead of bare "gt prime" which confuses agents
-		// The SessionStart hook handles context injection (gt prime --hook)
+		// Build startup beacon for predecessor discovery via /resume.
+		// Use FormatStartupBeacon instead of bare "gt prime" which confuses agents.
+		// The SessionStart hook handles context injection (gt prime --hook).
 		address := session.BeaconRecipient("crew", name, r.Name)
 		beacon := session.FormatStartupBeacon(session.BeaconConfig{
 			Recipient: address,
@@ -225,9 +201,8 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 			Topic:     "start",
 		})
 
-		// Use respawn-pane to replace shell with runtime directly
-		// This gives cleaner lifecycle: runtime exits → session ends (no intermediate shell)
-		// Export GT_ROLE and BD_ACTOR since tmux SetEnvironment only affects new panes
+		// Build startup command with BD_ACTOR and GT_ROLE embedded via exec env.
+		// This makes BD_ACTOR visible in the process tree (ps aux shows the full command).
 		startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
 			Role:        "crew",
 			Rig:         r.Name,
@@ -244,13 +219,19 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && claudeConfigDir != "" {
 			startupCmd = config.PrependEnv(startupCmd, map[string]string{runtimeConfig.Session.ConfigDirEnv: claudeConfigDir})
 		}
-		// Note: Don't call KillPaneProcesses here - this is a NEW session with just
-		// a fresh shell. Killing it would destroy the pane before we can respawn.
-		// KillPaneProcesses is only needed when restarting in an EXISTING session
-		// where Claude/Node processes might be running and ignoring SIGHUP.
-		if err := t.RespawnPane(paneID, startupCmd); err != nil {
-			return fmt.Errorf("starting runtime: %w", err)
+
+		// Create session with command directly to avoid send-keys race condition.
+		// NewSessionWithCommandAndEnv sets env vars via -e flags (session-level) AND
+		// the command embeds them via exec env (process-tree-visible).
+		// See: https://github.com/anthropics/gastown/issues/280
+		if err := t.NewSessionWithCommandAndEnv(sessionID, worker.ClonePath, startupCmd, envVars); err != nil {
+			return fmt.Errorf("creating session: %w", err)
 		}
+
+		// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
+		// Note: ConfigureGasTownSession includes cycle bindings
+		theme := getThemeForRig(r.Name)
+		_ = t.ConfigureGasTownSession(sessionID, theme, r.Name, name, "crew")
 
 		fmt.Printf("%s Created session for %s/%s\n",
 			style.Bold.Render("✓"), r.Name, name)
