@@ -233,6 +233,14 @@ type Config struct {
 	// Default is "warning" to suppress connection open/close noise. Override with
 	// GT_DOLT_LOGLEVEL=info (or debug) for diagnostics.
 	LogLevel string
+
+	// TransactionCommit controls dolt_transaction_commit (creates a Dolt commit per transaction).
+	// Expensive on high-write workloads. Default false. Override with GT_DOLT_TRANSACTION_COMMIT=true.
+	TransactionCommit bool
+
+	// AutoGC controls background garbage collection. Expensive on multi-DB servers.
+	// Default false (run gc manually via gt maintain). Override with GT_DOLT_AUTO_GC=true.
+	AutoGC bool
 }
 
 // DefaultConfig returns the default Dolt server configuration.
@@ -287,6 +295,12 @@ func DefaultConfig(townRoot string) *Config {
 	}
 	if ll := os.Getenv("GT_DOLT_LOGLEVEL"); ll != "" {
 		config.LogLevel = ll
+	}
+	if tc := os.Getenv("GT_DOLT_TRANSACTION_COMMIT"); tc == "true" || tc == "1" {
+		config.TransactionCommit = true
+	}
+	if agc := os.Getenv("GT_DOLT_AUTO_GC"); agc == "true" || agc == "1" {
+		config.AutoGC = true
 	}
 
 	// Fallback: if GT_DOLT_PORT is not in the shell env, read it from
@@ -1041,10 +1055,10 @@ listener:
 data_dir: "%s"
 
 behavior:
-  dolt_transaction_commit: true
+  dolt_transaction_commit: %t
   auto_gc_behavior:
-    enable: true
-    archive_level: 1
+    enable: %t
+    archive_level: %d
 `,
 		config.LogLevel,
 		config.Port,
@@ -1053,6 +1067,9 @@ behavior:
 		readTimeoutLine,
 		writeTimeoutLine,
 		config.DataDir,
+		config.TransactionCommit,
+		config.AutoGC,
+		map[bool]int{true: 1, false: 0}[config.AutoGC],
 	)
 
 	return os.WriteFile(configPath, []byte(content), 0600)
