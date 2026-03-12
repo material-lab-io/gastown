@@ -128,6 +128,8 @@ func (d *Daemon) parseLifecycleRequest(msg *BeadsMessage) *LifecycleRequest {
 			body.Action = "shutdown"
 		case bodyLower == "cycle" || bodyLower == "action: cycle":
 			body.Action = "cycle"
+		case bodyLower == "dispatch" || bodyLower == "action: dispatch":
+			body.Action = "dispatch"
 		default:
 			d.logger.Printf("Lifecycle request with unparseable body: %q", msg.Body)
 			return nil
@@ -143,6 +145,8 @@ func (d *Daemon) parseLifecycleRequest(msg *BeadsMessage) *LifecycleRequest {
 		action = ActionShutdown
 	case "cycle":
 		action = ActionCycle
+	case "dispatch":
+		action = ActionDispatch
 	default:
 		d.logger.Printf("Unknown lifecycle action: %q", body.Action)
 		return nil
@@ -157,6 +161,13 @@ func (d *Daemon) parseLifecycleRequest(msg *BeadsMessage) *LifecycleRequest {
 
 // executeLifecycleAction performs the requested lifecycle action.
 func (d *Daemon) executeLifecycleAction(request *LifecycleRequest) error {
+	// Dispatch action does not target a session — trigger scheduler directly.
+	if request.Action == ActionDispatch {
+		d.logger.Printf("Dispatch trigger received from %s — running scheduler", request.From)
+		d.dispatchQueuedWork()
+		return nil
+	}
+
 	// Determine session name from sender identity
 	sessionName := d.identityToSession(request.From)
 	if sessionName == "" {
