@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -297,24 +299,32 @@ func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
 
 // listWisps queries all ephemeral issues from the database.
 // Returns extended issue structs with comment_count and wisp_type.
+//
+// Uses bd export --all (JSONL format) instead of bd list --json because
+// bd list --json does not output valid JSON (known bd bug gt-70si21).
 func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
-	// Use bd list --json --all to get wisps in all statuses, unlimited
-	out, err := bd.Run("list", "--json", "--all", "-n", "0")
+	out, err := bd.Run("export", "--all")
 	if err != nil {
 		return nil, err
 	}
 
-	var allIssues []*compactIssue
-	if err := json.Unmarshal(out, &allIssues); err != nil {
-		return nil, fmt.Errorf("parsing issue list: %w", err)
-	}
-
-	// Filter to ephemeral only
 	var wisps []*compactIssue
-	for _, issue := range allIssues {
-		if issue.Ephemeral {
-			wisps = append(wisps, issue)
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
 		}
+		var issue compactIssue
+		if err := json.Unmarshal([]byte(line), &issue); err != nil {
+			continue // skip malformed lines
+		}
+		if issue.Ephemeral {
+			wisps = append(wisps, &issue)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading export output: %w", err)
 	}
 
 	return wisps, nil
