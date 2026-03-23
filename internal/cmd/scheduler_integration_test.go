@@ -421,7 +421,7 @@ func TestSchedulerSlingDryRun(t *testing.T) {
 	}
 
 	// Verify: no convoy created (HQ beads DB should have no convoy issues)
-	cmd := exec.Command("bd", "list", "--type=convoy", "--json")
+	cmd := exec.Command("bd", "list", "--label=gt:convoy", "--json")
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
 	if err != nil {

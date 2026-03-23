@@ -131,7 +131,7 @@ exit 0
 }
 
 // TestStrandedScanQueryShape verifies the exact arguments passed to bd
-// by findStrandedConvoys, ensuring the --type=convoy and --status=open
+// by findStrandedConvoys, ensuring the --label=gt:convoy and --status=open
 // flags are both present. This guards against flag drift in refactors.
 func TestStrandedScanQueryShape(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -177,7 +177,7 @@ exit 0
 
 	listLine := lines[0]
 
-	requiredFlags := []string{"list", "--type=convoy", "--status=open", "--json"}
+	requiredFlags := []string{"list", "--label=gt:convoy", "--status=open", "--json"}
 	for _, flag := range requiredFlags {
 		if !strings.Contains(listLine, flag) {
 			t.Errorf("bd list command missing %q; got: %q", flag, listLine)

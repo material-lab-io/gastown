@@ -66,7 +66,7 @@ func findConvoyByDescription(townRoot, beadID string) string {
 	townBeads := filepath.Join(townRoot, ".beads")
 
 	// Query all open convoys from HQ
-	listCmd := exec.Command("bd", "list", "--type=convoy", "--status=open", "--json")
+	listCmd := exec.Command("bd", "list", "--label=gt:convoy", "--status=open", "--json")
 	listCmd.Dir = townBeads
 
 	out, err := listCmd.Output()
@@ -340,15 +340,17 @@ func createBatchConvoy(beadIDs []string, rigName string, owned bool, mergeStrate
 		Merge: mergeStrategy,
 	})
 
+	batchLabels := []string{"gt:convoy"}
+	if owned {
+		batchLabels = append(batchLabels, "gt:owned")
+	}
 	createArgs := []string{
 		"create",
 		"--type=convoy",
+		"--labels=" + strings.Join(batchLabels, ","),
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
-	}
-	if owned {
-		createArgs = append(createArgs, "--labels=gt:owned")
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -405,15 +407,17 @@ func createAutoConvoy(beadID, beadTitle string, owned bool, mergeStrategy string
 		Merge: mergeStrategy,
 	})
 
+	singleLabels := []string{"gt:convoy"}
+	if owned {
+		singleLabels = append(singleLabels, "gt:owned")
+	}
 	createArgs := []string{
 		"create",
 		"--type=convoy",
+		"--labels=" + strings.Join(singleLabels, ","),
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
-	}
-	if owned {
-		createArgs = append(createArgs, "--labels=gt:owned")
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")

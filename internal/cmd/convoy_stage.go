@@ -509,7 +509,7 @@ func findOverlappingConvoys(slingableIDs []string) ([]overlappingConvoy, error) 
 	}
 
 	// List all convoys (--all includes every status).
-	out, err := runBdJSON(townBeads, "list", "--type=convoy", "--all", "--json")
+	out, err := runBdJSON(townBeads, "list", "--label=gt:convoy", "--all", "--json")
 	if err != nil {
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
@@ -690,6 +690,7 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
 	createArgs := []string{
 		"create",
 		"--type=convoy",
+		"--labels=gt:convoy",
 		"--id=" + convoyID,
 		"--title=" + title,
 		"--description=" + description,

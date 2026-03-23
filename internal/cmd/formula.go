@@ -428,6 +428,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 	createArgs := []string{
 		"create",
 		"--type=convoy",
+		"--labels=gt:convoy",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,

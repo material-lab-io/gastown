@@ -263,9 +263,9 @@ func (d *testDAG) BdStubScript() string {
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
 
-	// --- handle: list --type=convoy --all --json (overlapping convoy detection) ---
+	// --- handle: list --label=gt:convoy --all --json (overlapping convoy detection) ---
 	convoyListJSON := d.convoyListJSON()
-	sb.WriteString("  list\\ *--type=convoy*)\n")
+	sb.WriteString("  list\\ *--label=gt:convoy*)\n")
 	sb.WriteString(fmt.Sprintf("    echo '%s'\n", convoyListJSON))
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
@@ -412,12 +412,20 @@ func (d *testDAG) beadJSON(b *testBead) string {
 		issueType = "task"
 	}
 
+	// Map issue types to gt:* labels, matching the label-based type migration.
+	var labels []string
+	switch issueType {
+	case "agent", "rig", "role", "convoy", "epic", "task", "group", "channel", "queue":
+		labels = []string{"gt:" + issueType}
+	}
+
 	type beadOut struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		IssueType string `json:"issue_type"`
-		Parent    string `json:"parent,omitempty"`
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		Status    string   `json:"status"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels,omitempty"`
+		Parent    string   `json:"parent,omitempty"`
 	}
 
 	out := []beadOut{{
@@ -425,6 +433,7 @@ func (d *testDAG) beadJSON(b *testBead) string {
 		Title:     b.Title,
 		Status:    status,
 		IssueType: issueType,
+		Labels:    labels,
 		Parent:    b.Parent,
 	}}
 	raw, _ := json.Marshal(out)
@@ -518,7 +527,7 @@ func (d *testDAG) trackedBeadsJSONFor(convoyID string) string {
 	return string(raw)
 }
 
-// convoyListJSON returns the JSON array for `bd list --type=convoy --all --json`.
+// convoyListJSON returns the JSON array for `bd list --label=gt:convoy --all --json`.
 // Returns all convoy-type beads with their ID and status.
 func (d *testDAG) convoyListJSON() string {
 	type convoyEntry struct {
