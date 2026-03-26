@@ -396,9 +396,12 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 						hookB = beads.New(hookBeadPath)
 					}
 					hookBead, err := hookB.Show(agentBead.HookBead)
-					if err == nil {
+					if err == nil && (hookBead.Status == beads.StatusHooked || hookBead.Status == "in_progress") {
 						return hookBead
 					}
+					// Stale hook_bead (closed/tombstone/etc.): fall through to fallback query.
+					// Handles gt sling --force where old hook_bead was already closed before
+					// the agent bead slot was updated (gt-gkh2x4).
 				}
 			}
 		}
