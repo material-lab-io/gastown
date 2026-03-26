@@ -20,6 +20,7 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -1435,18 +1436,28 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	// Check rig bead labels (global/synced docked status)
 	// This is the persistent docked state set by 'gt rig dock'
 	rigPath := filepath.Join(d.config.TownRoot, rigName)
+
+	// Get beads prefix: try per-rig config.json first, then fall back to
+	// mayor/rigs.json for rigs without a standalone config.json (e.g. gastown
+	// itself, which is a rig-type codebase and has no rig root config.json).
+	// Without this fallback, isRigOperational silently skips the bead label
+	// check and the rig appears operational even when docked (gt-yrtu2u).
+	var rigBeadsPrefix string
 	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil {
-		rigBeadID := fmt.Sprintf("%s-rig-%s", rigCfg.Beads.Prefix, rigName)
-		rigBeadsDir := beads.ResolveBeadsDir(rigPath)
-		bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
-		if issue, err := bd.Show(rigBeadID); err == nil {
-			for _, label := range issue.Labels {
-				if label == "status:docked" {
-					return false, "rig is docked (global)"
-				}
-				if label == "status:parked" {
-					return false, "rig is parked (global)"
-				}
+		rigBeadsPrefix = rigCfg.Beads.Prefix
+	} else {
+		rigBeadsPrefix = config.GetRigPrefix(d.config.TownRoot, rigName)
+	}
+	rigBeadID := fmt.Sprintf("%s-rig-%s", rigBeadsPrefix, rigName)
+	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
+	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
+	if issue, err := bd.Show(rigBeadID); err == nil {
+		for _, label := range issue.Labels {
+			if label == "status:docked" {
+				return false, "rig is docked (global)"
+			}
+			if label == "status:parked" {
+				return false, "rig is parked (global)"
 			}
 		}
 	}

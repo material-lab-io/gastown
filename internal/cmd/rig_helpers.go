@@ -68,9 +68,14 @@ func getRig(rigName string) (string, *rig.Rig, error) {
 // Returns false if the rig config or bead can't be loaded (safe default).
 func hasRigBeadLabel(townRoot, rigName, label string) bool {
 	rigPath := filepath.Join(townRoot, rigName)
-	rigCfg, err := rig.LoadRigConfig(rigPath)
-	if err != nil || rigCfg.Beads == nil {
-		return false
+
+	// Get beads prefix: try per-rig config.json first, then fall back to
+	// mayor/rigs.json for rigs without a standalone config.json (gt-yrtu2u).
+	var prefix string
+	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil {
+		prefix = rigCfg.Beads.Prefix
+	} else {
+		prefix = config.GetRigPrefix(townRoot, rigName)
 	}
 
 	beadsPath := filepath.Join(rigPath, "mayor", "rig")
@@ -79,7 +84,7 @@ func hasRigBeadLabel(townRoot, rigName, label string) bool {
 	}
 
 	bd := beads.New(beadsPath)
-	rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, rigName)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
 
 	rigBead, err := bd.Show(rigBeadID)
 	if err != nil {
@@ -113,9 +118,14 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 
 	// Single bead lookup for both parked and docked labels
 	rigPath := filepath.Join(townRoot, rigName)
-	rigCfg, err := rig.LoadRigConfig(rigPath)
-	if err != nil || rigCfg.Beads == nil {
-		return false, ""
+
+	// Get beads prefix: try per-rig config.json first, then fall back to
+	// mayor/rigs.json for rigs without a standalone config.json (gt-yrtu2u).
+	var prefix string
+	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil {
+		prefix = rigCfg.Beads.Prefix
+	} else {
+		prefix = config.GetRigPrefix(townRoot, rigName)
 	}
 
 	beadsPath := filepath.Join(rigPath, "mayor", "rig")
@@ -124,7 +134,7 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 	}
 
 	bd := beads.New(beadsPath)
-	rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, rigName)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
 	rigBead, err := bd.Show(rigBeadID)
 	if err != nil {
 		return false, ""
