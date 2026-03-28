@@ -65,6 +65,8 @@ var beadsExemptCommands = map[string]bool{
 	"install":    true,
 	"tap":        true,
 	"dnd":        true,
+	"protect":       true, // Session protection must be fast, no beads needed
+	"unprotect":     true, // Session unprotection must be fast, no beads needed
 	"signal":        true, // Hook signal handlers must be fast, handle beads internally
 	"metrics":       true, // Metrics reads local JSONL, no beads needed
 	"krc":           true, // KRC doesn't require beads
