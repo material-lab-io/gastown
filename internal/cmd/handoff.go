@@ -824,10 +824,13 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	// 4. run claude with the startup beacon (triggers immediate context loading)
 	// Use exec to ensure clean process replacement.
 	//
-	// Check if current session is using a non-default agent (GT_AGENT env var).
-	// If so, preserve it across handoff by using the override variant.
-	// Fall back to tmux session environment if process env doesn't have it,
-	// since exec env vars may not propagate through all agent runtimes.
+	// Agent resolution priority:
+	// 1. role_agents config (authoritative — config changes take effect on next handoff)
+	// 2. GT_AGENT env var (only if role has no config mapping — manual override case)
+	// 3. default_agent fallback
+	//
+	// Previously GT_AGENT took unconditional priority, which meant config changes
+	// to role_agents were invisible until sessions were manually restarted.
 	currentAgent, agentInEnv := os.LookupEnv("GT_AGENT")
 	if !agentInEnv {
 		// GT_AGENT not in process env at all — try tmux session environment
@@ -838,16 +841,31 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		}
 	}
 	var runtimeCmd string
-	if currentAgent != "" {
+	if simpleRole != "" {
+		// Check if role_agents has a mapping for this role — if so, use it
+		// (config is authoritative over stale GT_AGENT env vars).
+		configAgent, isRoleSpecific := config.ResolveRoleAgentName(simpleRole, townRoot, rigPath)
+		if isRoleSpecific {
+			// Config has an explicit mapping — use it even if GT_AGENT differs.
+			// This ensures config changes (e.g., crew→opus) take effect on handoff.
+			runtimeCmd = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath).BuildCommandWithPrompt(beacon)
+			_ = configAgent // used by ResolveRoleAgentConfig internally
+		} else if currentAgent != "" {
+			// No role-specific config but GT_AGENT is set (manual override) — preserve it.
+			var err error
+			runtimeCmd, err = config.GetRuntimeCommandWithPromptAndAgentOverride(rigPath, beacon, currentAgent)
+			if err != nil {
+				return "", fmt.Errorf("resolving agent config: %w", err)
+			}
+		} else {
+			runtimeCmd = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath).BuildCommandWithPrompt(beacon)
+		}
+	} else if currentAgent != "" {
 		var err error
 		runtimeCmd, err = config.GetRuntimeCommandWithPromptAndAgentOverride(rigPath, beacon, currentAgent)
 		if err != nil {
 			return "", fmt.Errorf("resolving agent config: %w", err)
 		}
-	} else if simpleRole != "" {
-		// Preserve role_agents model selection across self-handoff by resolving
-		// runtime command via role-aware config (instead of default-agent lookup).
-		runtimeCmd = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath).BuildCommandWithPrompt(beacon)
 	} else {
 		runtimeCmd = config.GetRuntimeCommandWithPrompt(rigPath, beacon)
 	}
@@ -863,19 +881,29 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	var exports []string
 	var agentEnv map[string]string // agent config Env (rc.toml [agents.X.env])
 	if gtRole != "" {
-		// When GT_AGENT is set, resolve config with the override so we pick up
-		// the active agent's env (e.g., NODE_OPTIONS from [agents.X.env]).
-		// Otherwise, fall back to role-based resolution.
+		// Resolve agent config for environment variables (NODE_OPTIONS, etc.).
+		// When role_agents is authoritative, use role config; otherwise use GT_AGENT override.
 		var runtimeConfig *config.RuntimeConfig
-		if currentAgent != "" {
+		if simpleRole != "" {
+			if _, isRoleSpecific := config.ResolveRoleAgentName(simpleRole, townRoot, rigPath); isRoleSpecific {
+				runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
+			} else if currentAgent != "" {
+				rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, rigPath, currentAgent)
+				if err == nil {
+					runtimeConfig = rc
+				} else {
+					runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
+				}
+			} else {
+				runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
+			}
+		} else if currentAgent != "" {
 			rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, rigPath, currentAgent)
 			if err == nil {
 				runtimeConfig = rc
 			} else {
-				runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
+				runtimeConfig = config.ResolveAgentConfig(townRoot, rigPath)
 			}
-		} else if simpleRole != "" {
-			runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
 		} else {
 			runtimeConfig = config.ResolveAgentConfig(townRoot, rigPath)
 		}
@@ -892,8 +920,16 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	// when cwd-based detection fails (broken state recovery)
 	exports = append(exports, "GT_ROOT="+townRoot)
 
-	// Preserve GT_AGENT across handoff so agent override persists
-	if currentAgent != "" {
+	// Preserve GT_AGENT across handoff so agent override persists.
+	// When role_agents config is authoritative (isRoleSpecific), export the
+	// config-resolved agent name so GT_AGENT stays in sync with the actual model.
+	if simpleRole != "" {
+		if configAgent, isRoleSpecific := config.ResolveRoleAgentName(simpleRole, townRoot, rigPath); isRoleSpecific {
+			exports = append(exports, "GT_AGENT="+configAgent)
+		} else if currentAgent != "" {
+			exports = append(exports, "GT_AGENT="+currentAgent)
+		}
+	} else if currentAgent != "" {
 		exports = append(exports, "GT_AGENT="+currentAgent)
 	}
 
