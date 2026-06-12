@@ -232,6 +232,12 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Type: %s\n", msg.Type)
 	}
 
+	// Invalidate inject cache when sending to self so the new message
+	// appears on the very next agent turn rather than waiting for TTL.
+	if mailSendSelf {
+		invalidateInboxCache(from)
+	}
+
 	return nil
 }
 

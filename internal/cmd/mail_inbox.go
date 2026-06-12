@@ -214,6 +214,8 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 		// Non-fatal: message was retrieved, just couldn't mark
 		style.PrintWarning("could not mark message as read: %v", err)
 	}
+	// Invalidate inject cache so the next turn reflects the updated read state.
+	invalidateInboxCache(address)
 
 	// JSON output
 	if mailReadJSON {
@@ -566,6 +568,14 @@ func writeInboxCache(key string, data []byte) {
 	_ = os.WriteFile(p, data, 0644)
 }
 
+// invalidateInboxCache removes cached inbox entries for address (both all-messages
+// and unread-only keys). Called after the agent reads or marks messages as read
+// so the next inject turn reflects updated unread counts without waiting for TTL.
+func invalidateInboxCache(address string) {
+	_ = os.Remove(inboxCachePath(inboxCacheKey(address, false)))
+	_ = os.Remove(inboxCachePath(inboxCacheKey(address, true)))
+}
+
 func runMailMarkRead(cmd *cobra.Command, args []string) error {
 	// Determine which inbox
 	address := detectSender()
@@ -596,6 +606,7 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 				marked++
 			}
 		}
+		invalidateInboxCache(address)
 		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
 		return nil
 	}
@@ -625,6 +636,7 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to mark %d messages", len(errors))
 	}
 
+	invalidateInboxCache(address)
 	if len(args) == 1 {
 		fmt.Printf("%s Message marked as read\n", style.Bold.Render("✓"))
 	} else {

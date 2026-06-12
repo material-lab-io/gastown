@@ -30,6 +30,7 @@ var (
 	mailCheckInject   bool
 	mailCheckJSON     bool
 	mailCheckIdentity string
+	mailCheckNoCache  bool
 	mailThreadJSON    bool
 	mailReplySubject  string
 	mailReplyMessage  string
@@ -497,6 +498,7 @@ func init() {
 	mailCheckCmd.Flags().BoolVar(&mailCheckJSON, "json", false, "Output as JSON")
 	mailCheckCmd.Flags().StringVar(&mailCheckIdentity, "identity", "", "Explicit identity for inbox (e.g., greenplace/Toast)")
 	mailCheckCmd.Flags().StringVar(&mailCheckIdentity, "address", "", "Alias for --identity")
+	mailCheckCmd.Flags().BoolVar(&mailCheckNoCache, "no-cache", false, "Bypass inject cache (for diagnostics)")
 
 	// Thread flags
 	mailThreadCmd.Flags().BoolVar(&mailThreadJSON, "json", false, "Output as JSON")

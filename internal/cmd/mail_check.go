@@ -15,6 +15,40 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
+// loadMailCheckSnapshot loads the inbox snapshot for mail check.
+// In inject mode it reads from the shared inbox file cache (15s TTL, gt-936)
+// before falling back to a live Dolt query. Cache is shared with
+// 'gt mail inbox --json' so either command can warm it for the other.
+// --no-cache bypasses for diagnostics.
+func loadMailCheckSnapshot(mailbox inboxLister, address string) ([]*mail.Message, int, int, error) {
+	if mailCheckInject && !mailCheckNoCache {
+		cacheKey := inboxCacheKey(address, false)
+		if cached, ok := readInboxCache(cacheKey); ok {
+			var msgs []*mail.Message
+			if err := json.Unmarshal(cached, &msgs); err == nil {
+				total, unread := countInboxMessages(msgs)
+				return msgs, total, unread, nil
+			}
+		}
+	}
+
+	msgs, total, unread, err := loadInboxSnapshot(mailbox, false)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	// Write-through: populate cache for subsequent inject calls.
+	if mailCheckInject && !mailCheckNoCache {
+		cacheKey := inboxCacheKey(address, false)
+		if data, marshalErr := json.MarshalIndent(msgs, "", "  "); marshalErr == nil {
+			data = append(data, '\n')
+			writeInboxCache(cacheKey, data)
+		}
+	}
+
+	return msgs, total, unread, nil
+}
+
 func runMailCheck(cmd *cobra.Command, args []string) error {
 	// Determine which inbox (priority: --identity flag, auto-detect)
 	address := ""
@@ -47,7 +81,9 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 
 	// Load the inbox once. The inject path needs unread messages later, and
 	// calling Count() followed by ListUnread() doubles bd/Dolt reads.
-	messages, _, unread, err := loadInboxSnapshot(mailbox, false)
+	// For inject mode the result is served from a short-TTL file cache
+	// (gt-936) to avoid a Dolt round-trip on every agent turn.
+	messages, _, unread, err := loadMailCheckSnapshot(mailbox, address)
 	if err != nil {
 		if mailCheckInject {
 			fmt.Fprintf(os.Stderr, "gt mail check: inbox load error for %s: %v\n", address, err)
