@@ -251,8 +251,8 @@ const (
 
 // syncTarget syncs a single target's .claude/settings.json.
 // Uses MarshalSettings/UnmarshalSettings to preserve unknown fields.
+// Extends upstream SyncManagedClaudeSettings with MCP server injection (mempalace).
 func syncTarget(target hooks.Target, dryRun bool) (syncResult, error) {
-	// Compute expected hooks for this target
 	expected, err := hooks.ComputeExpected(target.Key)
 	if err != nil {
 		return 0, fmt.Errorf("computing expected config: %w", err)

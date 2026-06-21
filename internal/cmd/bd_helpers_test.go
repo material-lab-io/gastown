@@ -505,6 +505,48 @@ func TestBdCmd_DirPinsResolvedBeadsDir(t *testing.T) {
 	}
 }
 
+func TestBdCmd_DirPinsMetadataDatabaseOverInheritedDefault(t *testing.T) {
+	rigDir := t.TempDir()
+	beadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir beads dir: %v", err)
+	}
+	metadata := []byte(`{"dolt_database":"gastown","dolt_server_host":"127.0.0.2","dolt_server_port":4407}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	bdc := &bdCmd{
+		args: []string{"show", "gt-abc", "--json"},
+		env: []string{
+			"PATH=/usr/bin",
+			"BEADS_DIR=/town/.beads",
+			"BEADS_DB=/wrong.db",
+			"BD_DB=/wrong.bd",
+			"BEADS_DOLT_SERVER_DATABASE=hq",
+			"BEADS_DOLT_SERVER_HOST=wrong-host",
+			"BEADS_DOLT_SERVER_PORT=9999",
+			"BEADS_DOLT_PORT=9999",
+			"BEADS_DOLT_DATA_DIR=/wrong/data",
+		},
+		stderr: os.Stderr,
+	}
+	cmd := bdc.Dir(rigDir).Build()
+	envMap := parseEnv(cmd.Env)
+
+	if envMap["BEADS_DIR"] != beadsDir {
+		t.Fatalf("BEADS_DIR = %q, want %q in %v", envMap["BEADS_DIR"], beadsDir, cmd.Env)
+	}
+	if envMap["BEADS_DOLT_SERVER_DATABASE"] != "gastown" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want gastown in %v", envMap["BEADS_DOLT_SERVER_DATABASE"], cmd.Env)
+	}
+	for _, key := range []string{"BEADS_DB", "BD_DB", "BEADS_DOLT_DATA_DIR"} {
+		if value, ok := envMap[key]; ok {
+			t.Fatalf("%s should be stripped, got %q in %v", key, value, cmd.Env)
+		}
+	}
+}
+
 func TestBdCmd_WithBeadsDir_OverridesInherited(t *testing.T) {
 	// WithBeadsDir should override an inherited BEADS_DIR from the parent
 	// process. This is the core fix for gt-ctir: without overriding,
@@ -569,8 +611,8 @@ func TestBdCmd_WithBeadsDir_OverridesInheritedDoltTarget(t *testing.T) {
 	if envMap["BEADS_DIR"] != beadsDir {
 		t.Errorf("BEADS_DIR = %q, want %q", envMap["BEADS_DIR"], beadsDir)
 	}
-	if _, ok := envMap["BEADS_DOLT_SERVER_DATABASE"]; ok {
-		t.Errorf("BEADS_DOLT_SERVER_DATABASE should be absent when BEADS_DIR is pinned, got %q", envMap["BEADS_DOLT_SERVER_DATABASE"])
+	if envMap["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
+		t.Errorf("BEADS_DOLT_SERVER_DATABASE = %q, want rigdb", envMap["BEADS_DOLT_SERVER_DATABASE"])
 	}
 	if envMap["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" {
 		t.Errorf("BEADS_DOLT_SERVER_HOST = %q, want 127.0.0.1", envMap["BEADS_DOLT_SERVER_HOST"])

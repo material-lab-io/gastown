@@ -1,6 +1,6 @@
 description = "Per-rig worker monitor patrol loop.\n\nThe Witness is the Pit Boss for your rig. You watch polecats, nudge them toward\ncompletion, verify clean git state before kills, and escalate stuck workers.\n\n**You do NOT do implementation work.** Your job is oversight, not coding.\n\n## Ephemeral Polecat Model\n\nPolecats are truly ephemeral - done at MR submission, recyclable immediately:\n\n```\nPolecat lifecycle: spawning → working → mr_submitted → nuked\nMR lifecycle:      created → queued → processed → merged (Refinery handles)\n```\n\nOnce a polecat's branch is pushed (cleanup_status=clean), the polecat can be\nnuked immediately. The MR continues independently in the Refinery. If conflicts\narise, Refinery creates a NEW conflict-resolution task for a NEW polecat.\n\n**Key principle**: Polecat lifecycle is separate from MR lifecycle.\n\n## Design Philosophy\n\nThis patrol follows Gas Town principles:\n- **Discovery over tracking**: Observe reality each cycle, don't maintain state\n- **Events over state**: POLECAT_DONE mail triggers immediate cleanup\n- **Ephemeral by default**: Clean polecats are nuked immediately, no waiting\n- **Cleanup wisps for exceptions**: Only created when intervention needed\n- **Task tool for parallelism**: Subagents inspect polecats, not molecule arms\n\n## Patrol Shape (Linear, Deacon-style)\n\n```\ninbox-check ─► process-cleanups ─► check-refinery ─► survey-workers\n                                                            │\n         ┌──────────────────────────────────────────────────┘\n         ▼\n  check-timer-gates ─► check-swarm ─► ping-deacon ─► patrol-cleanup ─► context-check ─► loop-or-exit\n```\n\nNo dynamic arms. No fanout gates. No persistent nudge counters.\nState is discovered each cycle from reality (tmux, beads, mail)."
 formula = 'mol-witness-patrol'
-version = 2
+version = 13
 
 [vars]
 [vars.wisp_type]
@@ -61,7 +61,89 @@ needs = ['patrol-cleanup']
 title = 'Check own context limit'
 
 [[steps]]
-description = "End of patrol cycle decision.\n\n**If context LOW** (can continue patrolling):\n1. Generate a brief summary of this patrol cycle\n2. Squash the current wisp:\n```bash\nbd mol squash <mol-id> --summary \"<patrol-summary>\"\n```\n3. Create a new patrol wisp:\n```bash\nbd mol wisp mol-witness-patrol\n```\n4. Continue executing from the inbox-check step of the new wisp\n\n**If context HIGH** (approaching limit):\n1. Write handoff mail with notable observations:\n```bash\ngt handoff -s \"Witness patrol handoff\" -m \"<observations>\"\n```\n2. Exit cleanly - the daemon will respawn a fresh Witness session\n\n**IMPORTANT**: You must either create a new wisp (context LOW) or exit (context HIGH).\nNever leave the session idle without work on your hook."
+<<<<<<< HEAD
+description = """
+End of patrol cycle decision.
+
+**If context LOW** (can continue patrolling):
+
+Resolve your agent bead ID for this patrol cycle. Verify your agent bead exists before subscribing:
+```bash
+YOUR_AGENT_BEAD=$(gt agents resolve --role witness --rig {{rig}})
+```
+This must resolve exactly one bead ID. If it fails, STOP and report the error. If it reports multiple results, STOP and report the ambiguity — manual disambiguation is required.
+
+Then use await-signal with exponential backoff to wait for activity:
+
+```bash
+gt mol step await-signal --agent-bead "$YOUR_AGENT_BEAD" \
+  --backoff-base 30s --backoff-mult 2 --backoff-max 5m
+```
+
+This command:
+1. Subscribes to `bd activity --follow` (beads activity feed)
+2. Returns IMMEDIATELY when any beads activity occurs
+3. If no activity, times out with exponential backoff:
+   - First timeout: 30s
+   - Second timeout: 60s
+   - Third timeout: 120s
+   - ...capped at 5 minutes max
+4. Tracks `idle:N` label on your agent bead for backoff state
+5. Outputs `EFFORT: reduced` or `EFFORT: full` directive for next cycle
+
+**On signal received** (activity detected):
+Reset the idle counter and start next patrol cycle:
+```bash
+gt agents state "$YOUR_AGENT_BEAD" --set idle=0
+```
+
+**On timeout** (no activity):
+The idle counter was auto-incremented. Continue to next patrol cycle
+(the longer backoff will apply next time).
+
+## Effort-Based Patrol Routing
+
+After await-signal returns, check the EFFORT directive in the output:
+
+**If `EFFORT: full`** — Run all steps thoroughly (normal patrol).
+
+**If `EFFORT: reduced`** — Run ABBREVIATED patrol:
+- inbox-check: `gt mail drain` only, skip individual messages unless HELP found
+- process-cleanups: SKIP
+- check-refinery: Quick session status checks only
+- survey-workers: `gt patrol scan --notify` only, skip orphan bead detection
+- check-timer-gates: SKIP
+- check-swarm-completion: SKIP
+- patrol-cleanup: SKIP
+- context-check: One-sentence self-assessment
+
+Abbreviated patrol should complete in ~10% of the tokens of a full patrol.
+Mark skipped steps as SKIP in the patrol report.
+
+After await-signal returns (either by signal or timeout):
+1. Generate a brief summary of this patrol cycle's observations
+2. Close current patrol and start next cycle:
+```bash
+gt patrol report --summary "<brief summary of patrol observations>"
+```
+This closes the current patrol wisp and automatically creates a new one.
+3. Continue executing from the first step of the new patrol cycle
+
+**If context HIGH** (approaching limit):
+1. Write handoff mail with notable observations:
+```bash
+gt handoff -s "Witness patrol handoff" -m "<observations>"
+```
+2. Exit cleanly - the daemon will respawn a fresh Witness session
+
+**NOTE (gt-058d)**: `gt handoff` enforces a minimum 2-minute cooldown between
+handoffs. If the previous handoff was less than 2 minutes ago, the command
+will sleep until the cooldown expires before proceeding. This prevents tight
+restart loops when the rig is idle and patrols complete quickly.
+
+**IMPORTANT**: You must either report and loop (context LOW) or exit (context HIGH).
+Never leave the session idle without work on your hook.
+"""
 id = 'loop-or-exit'
 needs = ['context-check']
 title = 'Loop or exit for respawn'

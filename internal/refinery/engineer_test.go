@@ -40,6 +40,33 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 	}
 }
 
+func TestIsConflictTaskForMR(t *testing.T) {
+	task := &beads.Issue{Description: `Resolve merge conflicts for branch polecat/nux/gt-real
+
+## Metadata
+- Original MR: gt-mr1
+- Branch: polecat/nux/gt-real
+- Conflict with: main@abc123
+- Original issue: gt-real
+- Retry count: 1`}
+
+	if !isConflictTaskForMR(task, "gt-mr1", "gt-real") {
+		t.Fatal("expected task metadata to verify")
+	}
+	if isConflictTaskForMR(task, "gt-other", "gt-real") {
+		t.Fatal("task verified for wrong MR")
+	}
+	if isConflictTaskForMR(task, "gt-mr1", "gt-other") {
+		t.Fatal("task verified for wrong source issue")
+	}
+	if isConflictTaskForMR(task, "gt-mr", "gt-real") {
+		t.Fatal("task verified for MR prefix")
+	}
+	if isConflictTaskForMR(task, "gt-mr1", "gt-rea") {
+		t.Fatal("task verified for source issue prefix")
+	}
+}
+
 func TestEngineerClearAgentActiveMRUsesTownBeadsDir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mock for bd")
@@ -123,7 +150,7 @@ esac
 	if strings.Contains(logOutput, "env="+rigBeadsDir) {
 		t.Fatalf("refinery active_mr cleanup used rig BEADS_DIR; log:\n%s", logOutput)
 	}
-	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, " show") || !strings.Contains(logOutput, " update") {
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, "args=show") || !strings.Contains(logOutput, "args=update") {
 		t.Fatalf("refinery active_mr cleanup did not use town BEADS_DIR; log:\n%s", logOutput)
 	}
 }

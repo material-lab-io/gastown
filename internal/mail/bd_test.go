@@ -1,11 +1,13 @@
 package mail
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBdError_Error(t *testing.T) {
@@ -166,6 +168,65 @@ func TestBdError_ImplementsErrorInterface(t *testing.T) {
 	_ = err.Error() // Should compile and not panic
 }
 
+func TestParseBeadsListOutput(t *testing.T) {
+	created := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	valid, err := json.Marshal([]BeadsMessage{{
+		ID:        "msg-1",
+		Title:     "Hello",
+		Status:    "open",
+		Priority:  2,
+		CreatedAt: created,
+		Labels:    []string{"gt:message", "from:mayor/"},
+	}})
+	if err != nil {
+		t.Fatalf("marshal valid message: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		input   []byte
+		wantLen int
+		wantErr bool
+	}{
+		{name: "empty", input: nil},
+		{name: "plain no issues", input: []byte("No issues found.\n")},
+		{name: "null", input: []byte("null\n")},
+		{name: "empty array", input: []byte("[]\n")},
+		{name: "valid array", input: valid, wantLen: 1},
+		{name: "non json", input: []byte("warning: no rows")},
+		{name: "malformed json", input: []byte("[{bad json]"), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseBeadsListOutput(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseBeadsListOutput() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if len(got) != tt.wantLen {
+				t.Fatalf("parseBeadsListOutput() returned %d messages, want %d", len(got), tt.wantLen)
+			}
+		})
+	}
+
+	got, err := parseBeadsListOutput(valid)
+	if err != nil {
+		t.Fatalf("parse valid output: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("parse valid output returned %d messages, want 1", len(got))
+	}
+	if got[0].ID != "msg-1" || got[0].Title != "Hello" || got[0].Status != "open" || got[0].Priority != 2 {
+		t.Fatalf("parse valid output returned unexpected message: %#v", got[0])
+	}
+	if !got[0].CreatedAt.Equal(created) {
+		t.Fatalf("CreatedAt = %v, want %v", got[0].CreatedAt, created)
+	}
+	if len(got[0].Labels) != 2 || got[0].Labels[0] != "gt:message" || got[0].Labels[1] != "from:mayor/" {
+		t.Fatalf("Labels = %#v, want gt:message/from:mayor/", got[0].Labels)
+	}
+}
+
 func TestBdError_WithAllFields(t *testing.T) {
 	originalErr := errors.New("original error")
 	bdErr := &bdError{
@@ -260,8 +321,8 @@ func TestBdSubprocessEnv_FiltersStaleBdTargetEnv(t *testing.T) {
 	if !envContains(got, "BEADS_DIR="+beadsDir) {
 		t.Fatalf("expected current BEADS_DIR in env, got %v", got)
 	}
-	if _, ok := envLastValue(got, "BEADS_DOLT_SERVER_DATABASE"); ok {
-		t.Fatalf("database selector should be absent when BEADS_DIR is pinned, got %v", got)
+	if value, ok := envLastValue(got, "BEADS_DOLT_SERVER_DATABASE"); !ok || value != "rigdb" {
+		t.Fatalf("database selector = %q present=%v, want rigdb in %v", value, ok, got)
 	}
 	for _, want := range []string{"BD_READONLY=true", "BD_DOLT_AUTO_COMMIT=off", "BD_EXPORT_AUTO=false", "BD_BACKUP_ENABLED=false", "BD_DOLT_AUTO_PUSH=false", "BD_NO_PUSH=true", "BD_EXPORT_GIT_ADD=false", "BD_NO_GIT_OPS=true"} {
 		if !envContains(got, want) {

@@ -155,36 +155,41 @@ func runStatusLine(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Run, capture output, write cache
+	// Run, capture output, write cache (mayor and deacon only)
 	output, err := captureStatusLineOutput(func() error {
-		// Determine identity and output based on role
 		if role == "mayor" || statusLineSession == mayorSession {
 			return runMayorStatusLine(t)
 		}
-		// Deacon status line
 		if role == "deacon" || statusLineSession == deaconSession {
 			return runDeaconStatusLine(t)
 		}
-		// Witness status line (session naming: gt-<rig>-witness)
-		if role == "witness" || strings.HasSuffix(statusLineSession, "-witness") {
-			return runWitnessStatusLine(t, rigName)
-		}
-		// Refinery status line
-		if role == "refinery" || strings.HasSuffix(statusLineSession, "-refinery") {
-			return runRefineryStatusLine(t, rigName)
-		}
-		// Crew/Polecat status line
-		return runWorkerStatusLine(t, statusLineSession, rigName, polecat, crew, issue)
+		return nil
 	})
 	if err == nil && output != "" {
 		writeStatusLineCache(cacheKey, output)
 	}
 	fmt.Print(output)
-	return err
+	if role == "mayor" || statusLineSession == mayorSession ||
+		role == "deacon" || statusLineSession == deaconSession {
+		return err
+	}
+
+	// Witness status line (session naming: gt-<rig>-witness)
+	if role == "witness" || strings.HasSuffix(statusLineSession, "-witness") {
+		return runWitnessStatusLine(t, rigName)
+	}
+
+	// Refinery status line
+	if role == "refinery" || strings.HasSuffix(statusLineSession, "-refinery") {
+		return runRefineryStatusLine(rigName)
+	}
+
+	// Crew/Polecat status line
+	return runWorkerStatusLine(polecat, crew, issue)
 }
 
 // runWorkerStatusLine outputs status for crew or polecat sessions.
-func runWorkerStatusLine(t *tmux.Tmux, session, rigName, polecat, crew, issue string) error {
+func runWorkerStatusLine(polecat, crew, issue string) error {
 	// Determine agent type and identity
 	var icon string
 	if polecat != "" {
@@ -511,7 +516,7 @@ func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 
 // runRefineryStatusLine outputs status for a refinery session.
 // Shows: MQ length, current item, hook or mail preview
-func runRefineryStatusLine(t *tmux.Tmux, rigName string) error {
+func runRefineryStatusLine(rigName string) error {
 	if rigName == "" {
 		// Try to extract from session name: <prefix>-refinery
 		if identity, err := session.ParseSessionName(statusLineSession); err == nil && identity.Role == session.RoleRefinery {

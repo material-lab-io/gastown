@@ -16,7 +16,6 @@ import (
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
-	gtlock "github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/util"
@@ -484,6 +483,12 @@ func (b *Beads) targetBeadsDirForCreate(opts CreateOptions) (string, error) {
 
 	if opts.Rig != "" {
 		if targetDir, ok := ResolveRepoAliasBeadsDir(townRoot, opts.Rig); ok {
+			if opts.Rig != "hq" && opts.Rig != "town" {
+				prefix := GetPrefixForRig(townRoot, opts.Rig)
+				if err := EnsureConfigYAML(targetDir, prefix); err != nil {
+					return "", fmt.Errorf("ensuring beads config for rig %q: %w", opts.Rig, err)
+				}
+			}
 			return targetDir, nil
 		}
 		return "", fmt.Errorf("unknown repo/rig alias %q", opts.Rig)
@@ -548,8 +553,6 @@ func (b *Beads) Init(prefix string) error {
 // Investigation: dc-1pq8 (forensic report 2026-05-02).
 const bdSubprocessTimeout = 60 * time.Second
 
-const bdReadThrottleTimeout = 5 * time.Second
-
 // resolveBdSubprocessTimeout returns the configured timeout, honoring the
 // GT_BD_TIMEOUT_SEC env var override (must parse as a positive integer).
 func resolveBdSubprocessTimeout() time.Duration {
@@ -588,15 +591,6 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	beadsDir := b.getResolvedBeadsDir()
 	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
-	if shouldThrottleBDRead(fullArgs) {
-		unlock, err := b.acquireBDReadThrottle(bdReadThrottleTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("bd %s: %w", strings.Join(fullArgs, " "), err)
-		}
-		if unlock != nil {
-			defer unlock()
-		}
-	}
 
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
@@ -659,42 +653,6 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	}
 
 	return stripStdoutWarnings(stdout.Bytes()), nil
-}
-
-func shouldThrottleBDRead(args []string) bool {
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		return arg == "list"
-	}
-	return false
-}
-
-func (b *Beads) acquireBDReadThrottle(timeout time.Duration) (func(), error) {
-	townRoot := b.getTownRoot()
-	if townRoot == "" {
-		return nil, nil
-	}
-	lockDir := filepath.Join(townRoot, ".runtime")
-	if err := os.MkdirAll(lockDir, 0755); err != nil {
-		return nil, err
-	}
-	lockPath := filepath.Join(lockDir, "bd-list-read.flock")
-	deadline := time.Now().Add(timeout)
-	for {
-		unlock, ok, err := gtlock.FlockTryAcquire(lockPath)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return unlock, nil
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for bd list read throttle")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 }
 
 // runWithRouting executes a bd command without setting BEADS_DIR, allowing bd's
@@ -805,8 +763,8 @@ func (b *Beads) buildRunEnv() []string {
 	// keep buildRunEnv focused on Dolt target isolation and avoid duplicate
 	// first-match-sensitive BEADS_DIR entries.
 	env := BuildPinnedBDEnv(os.Environ(), b.getResolvedBeadsDir())
-	env = stripEnvKey(env, "BEADS_DIR")
-	return stripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
+	env = StripEnvKey(env, "BEADS_DIR")
+	return StripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
 }
 
 // buildRoutingEnv builds the environment for runWithRouting() calls.
@@ -824,7 +782,7 @@ func (b *Beads) buildRoutingEnv() []string {
 		return SuppressBDSideEffects(env)
 	}
 	env := BuildRoutingBDEnv(os.Environ(), b.getResolvedBeadsDir())
-	return stripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
+	return StripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
 }
 
 // filterBeadsEnv removes beads-related environment variables from the given
@@ -1033,21 +991,21 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	clauses := []string{"ephemeral=true"}
 
 	if opts.Label != "" {
-		clauses = append(clauses, "label="+opts.Label)
+		clauses = append(clauses, "label="+quoteBDQueryValue(opts.Label))
 	} else if opts.Type != "" {
-		clauses = append(clauses, "label=gt:"+opts.Type)
+		clauses = append(clauses, "label="+quoteBDQueryValue("gt:"+opts.Type))
 	}
 	if opts.Status != "" && opts.Status != "all" {
-		clauses = append(clauses, "status="+opts.Status)
+		clauses = append(clauses, "status="+quoteBDQueryValue(opts.Status))
 	}
 	if opts.Priority >= 0 {
 		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
 	}
 	if opts.Parent != "" {
-		clauses = append(clauses, "parent="+opts.Parent)
+		clauses = append(clauses, "parent="+quoteBDQueryValue(opts.Parent))
 	}
 	if opts.Assignee != "" {
-		clauses = append(clauses, "assignee="+opts.Assignee)
+		clauses = append(clauses, "assignee="+quoteBDQueryValue(opts.Assignee))
 	}
 
 	queryExpr := strings.Join(clauses, " AND ")
@@ -1058,6 +1016,9 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	} else {
+		// Match List's no-truncation default; bd query otherwise silently caps at 50.
+		args = append(args, "--limit=0")
 	}
 
 	out, err := b.run(args...)
@@ -1075,6 +1036,10 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 
 	return issues, nil
+}
+
+func quoteBDQueryValue(value string) string {
+	return strconv.Quote(value)
 }
 
 // stripStdoutWarnings removes warning/diagnostic lines that bd may emit to stdout.
@@ -1370,9 +1335,49 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 	return newest, nil
 }
 
-// ShowMultiple fetches multiple issues by ID in a single bd call.
+// ShowMultiple fetches multiple issues by ID, grouped by routed database.
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
+// If one routed group fails, successful groups are returned with the error.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
+	if len(ids) == 0 {
+		return make(map[string]*Issue), nil
+	}
+
+	if !b.noRoute {
+		fallbackDir := b.getResolvedBeadsDir()
+		groups := make(map[string][]string)
+		for _, id := range ids {
+			targetDir := ResolveRoutingTarget(b.getTownRoot(), id, fallbackDir)
+			groups[targetDir] = append(groups[targetDir], id)
+		}
+
+		if len(groups) > 1 || groups[fallbackDir] == nil {
+			result := make(map[string]*Issue, len(ids))
+			var firstErr error
+			for targetDir, groupIDs := range groups {
+				target := b
+				if targetDir != fallbackDir {
+					target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+				}
+				issues, err := target.showMultipleLocal(groupIDs)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				for id, issue := range issues {
+					result[id] = issue
+				}
+			}
+			return result, firstErr
+		}
+	}
+
+	return b.showMultipleLocal(ids)
+}
+
+func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
 	}
