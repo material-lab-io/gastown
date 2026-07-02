@@ -14,11 +14,13 @@ import (
 
 const (
 	// bdReadTimeout is the timeout for bd read operations (list, show, query).
-	// 60s accommodates concurrent agent load where multiple bd processes compete
-	// for Dolt locks and memory (was 30s, caused signal:killed under contention).
-	bdReadTimeout = 60 * time.Second
+	// 180s accommodates cross-continent Tailscale relay paths (~180ms RTT) where
+	// large mail inboxes (900+ msgs) can take 60-90s to list. Was 60s, which caused
+	// consistent kills on Mac→GT2 (Helsinki) Tailscale relay queries.
+	bdReadTimeout = 180 * time.Second
 	// bdWriteTimeout is the timeout for bd write operations (create, close, label, reopen).
-	bdWriteTimeout = 60 * time.Second
+	// Raised from 60s to 120s for the same cross-continent Tailscale relay reason.
+	bdWriteTimeout = 120 * time.Second
 )
 
 // bdError represents an error from running a bd command.
