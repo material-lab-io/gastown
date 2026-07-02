@@ -877,6 +877,11 @@ behavior:
 		eventSchedulerLine,
 		systemVariablesBlock,
 	)
+	// GT_DOLT_CLUSTER_EXTRA: verbatim YAML appended to the config for cluster
+	// replication settings (cluster:, remotesapi:). Survives daemon restarts.
+	if extra := strings.TrimSpace(os.Getenv("GT_DOLT_CLUSTER_EXTRA")); extra != "" {
+		content += "\n" + extra + "\n"
+	}
 	return os.WriteFile(configPath, []byte(content), 0600)
 }
 

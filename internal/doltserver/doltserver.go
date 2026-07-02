@@ -139,7 +139,7 @@ func setDoltGlobalConfig(key, value string) error {
 const (
 	DefaultPort           = 3307
 	DefaultUser           = "root" // Default Dolt user (no password for local access)
-	DefaultMaxConnections = 1000   // Dolt default; override via GT_DOLT_MAX_CONNECTIONS
+	DefaultMaxConnections = 1000   // Dolt default; no reason to limit below (Tim Sehn confirmed 1k is fine)
 
 	// DefaultReadTimeoutMs is the server-side timeout for reading a complete request from a client.
 	// Controls how long Dolt waits for a client to send a query on an idle connection.
@@ -400,12 +400,6 @@ func DefaultConfig(townRoot string) *Config {
 	}
 	if agc := os.Getenv("GT_DOLT_AUTO_GC"); agc == "true" || agc == "1" {
 		config.AutoGC = true
-	}
-	// Override with GT_DOLT_MAX_CONNECTIONS.
-	if mc := os.Getenv("GT_DOLT_MAX_CONNECTIONS"); mc != "" {
-		if v, err := strconv.Atoi(mc); err == nil && v > 0 {
-			config.MaxConnections = v
-		}
 	}
 
 	// Fallback: if GT_DOLT_PORT is not in the shell env, read it from
@@ -1359,7 +1353,7 @@ func FindIdleMonitorProcesses(townRoot string) []int {
 func findIdleMonitorProcessesFromPS(output, townRoot, absRoot string, port int) []int {
 	portStr := strconv.Itoa(port)
 	var pids []int
-	for _, line := range strings.Split(output, "\n") {
+	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.Contains(line, "idle-monitor") {
 			continue
@@ -2748,7 +2742,7 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 	if err != nil {
 		return fmt.Errorf("opening beads database: %w", err)
 	}
-	defer func() { _ = store.Close() }()
+	defer store.Close()
 
 	if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("setting issue_prefix: %w", err)
