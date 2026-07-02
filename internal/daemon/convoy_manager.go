@@ -24,6 +24,14 @@ const (
 	// auto-close. This prevents a race where the daemon's stranded scan
 	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
 	convoyGracePeriod = 5 * time.Minute
+
+	// storeOpenBackoffInit / Max control how quickly the event-poll retries
+	// opening beads stores when they are unavailable (e.g. read-only standby
+	// or Dolt not yet ready). Without backoff a read-only standby causes a
+	// hot-loop that generates thousands of errors per minute and triggers the
+	// Convoy manager to reprime crew sessions (gy-bi1bi).
+	storeOpenBackoffInit = 5 * time.Second
+	storeOpenBackoffMax  = 5 * time.Minute
 )
 
 // strandedConvoyInfo matches the JSON output of `gt convoy stranded --json`.
@@ -186,16 +194,36 @@ func (m *ConvoyManager) runEventPoll() {
 	ticker := time.NewTicker(eventPollInterval)
 	defer ticker.Stop()
 
+	// storeOpenBackoff tracks exponential backoff for beads-store open failures
+	// so a read-only standby or unreachable Dolt doesn't generate a hot-loop.
+	storeOpenBackoff := storeOpenBackoffInit
+	var storeRetryAfter time.Time
+
 	for {
 		select {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
 			m.storesMu.Lock()
-			// Lazy store initialization: retry if stores not yet available
+			// Lazy store initialization with exponential backoff: when the
+			// beads store is unavailable (read-only standby, Dolt not ready),
+			// wait storeOpenBackoff before retrying so we don't hammer Dolt.
 			if len(m.stores) == 0 {
-				if m.openStores != nil {
+				if m.openStores != nil && !time.Now().Before(storeRetryAfter) {
 					m.stores = m.openStores()
+					if len(m.stores) == 0 {
+						m.logger("Convoy: beads stores unavailable, backing off %v", storeOpenBackoff)
+						storeRetryAfter = time.Now().Add(storeOpenBackoff)
+						if storeOpenBackoff < storeOpenBackoffMax {
+							storeOpenBackoff *= 2
+							if storeOpenBackoff > storeOpenBackoffMax {
+								storeOpenBackoff = storeOpenBackoffMax
+							}
+						}
+					} else {
+						storeOpenBackoff = storeOpenBackoffInit
+						storeRetryAfter = time.Time{}
+					}
 				}
 				if len(m.stores) == 0 {
 					m.storesMu.Unlock()
